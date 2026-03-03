@@ -236,7 +236,7 @@ def upload_to_supabase_storage(export_dir: str):
 def trigger_github_action():
     """Trigger the process-ahrefs workflow via GitHub API."""
     token = os.getenv("GITHUB_TOKEN")
-    repo = os.getenv("GITHUB_REPO", "ztudium/ztudium-data-pipeline")
+    repo = os.getenv("GITHUB_REPO", "SujalSokandeDev/ztudium-data-pipeline")
 
     if not token:
         logger.info("")

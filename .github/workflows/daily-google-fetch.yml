@@ -1,0 +1,59 @@
+name: Daily Google Fetch (GSC + GA4)
+
+on:
+  schedule:
+    # Run daily at 00:30 UTC (6:00 AM IST)
+    - cron: '30 0 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-google-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > /tmp/google-credentials.json
+
+      - name: Fetch GSC + GA4 and upload to Supabase
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GSC_PROPERTY_CITIESABC: ${{ secrets.GSC_PROPERTY_CITIESABC }}
+          GSC_PROPERTY_BUSINESSABC: ${{ secrets.GSC_PROPERTY_BUSINESSABC }}
+          GSC_PROPERTY_HEDGETHINK: ${{ secrets.GSC_PROPERTY_HEDGETHINK }}
+          GSC_PROPERTY_FASHIONABC: ${{ secrets.GSC_PROPERTY_FASHIONABC }}
+          GSC_PROPERTY_TRADERSDNA: ${{ secrets.GSC_PROPERTY_TRADERSDNA }}
+          GSC_PROPERTY_FREEDOMX: ${{ secrets.GSC_PROPERTY_FREEDOMX }}
+          GSC_PROPERTY_WISDOMIA: ${{ secrets.GSC_PROPERTY_WISDOMIA }}
+          GSC_PROPERTY_SPORTSDNA: ${{ secrets.GSC_PROPERTY_SPORTSDNA }}
+          GSC_PROPERTY_INTELLIGENTHQ: ${{ secrets.GSC_PROPERTY_INTELLIGENTHQ }}
+          GA4_PROPERTY_CITIESABC: ${{ secrets.GA4_PROPERTY_CITIESABC }}
+          GA4_PROPERTY_BUSINESSABC: ${{ secrets.GA4_PROPERTY_BUSINESSABC }}
+          GA4_PROPERTY_HEDGETHINK: ${{ secrets.GA4_PROPERTY_HEDGETHINK }}
+          GA4_PROPERTY_FASHIONABC: ${{ secrets.GA4_PROPERTY_FASHIONABC }}
+          GA4_PROPERTY_TRADERSDNA: ${{ secrets.GA4_PROPERTY_TRADERSDNA }}
+          GA4_PROPERTY_FREEDOMX: ${{ secrets.GA4_PROPERTY_FREEDOMX }}
+          GA4_PROPERTY_WISDOMIA: ${{ secrets.GA4_PROPERTY_WISDOMIA }}
+          GA4_PROPERTY_SPORTSDNA: ${{ secrets.GA4_PROPERTY_SPORTSDNA }}
+          GA4_PROPERTY_INTELLIGENTHQ: ${{ secrets.GA4_PROPERTY_INTELLIGENTHQ }}
+        run: python scripts/fetch_google.py
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f /tmp/google-credentials.json

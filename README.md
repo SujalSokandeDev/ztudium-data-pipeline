@@ -1,148 +1,81 @@
 # Ztudium Data Pipeline
 
-Automated data pipeline for 9 Ztudium websites. Fetches GSC + GA4 data daily via GitHub Actions and processes Ahrefs CSV exports via Supabase Storage.
+Automated ingestion for Google (GSC + GA4) and Ahrefs exports into Supabase.
 
 ## Architecture
 
-```
-Daily (automatic):   GitHub Actions → GSC/GA4 API → Supabase DB
-Weekly (semi-manual): Local Ahrefs export → Supabase Storage → GitHub Actions → Supabase DB
-```
+- `daily-google-fetch.yml` runs `scripts/fetch_google.py` (API pull -> Supabase upsert).
+- `process-ahrefs.yml` runs `scripts/process_ahrefs.py` (Storage files -> parse -> Supabase upsert).
+- Frontend reads Supabase directly.
+- Refresh buttons dispatch GitHub workflows through a server-side API route in the frontend app.
 
-## What's Automated
+## Data Model And Migrations
 
-| Task | Frequency | How |
-|------|-----------|-----|
-| GSC + GA4 fetch | Daily 6 AM IST | GitHub Actions cron |
-| Ahrefs CSV processing | After local export | GitHub Actions (triggered) |
-| Supabase DB updates | Automatic | Both workflows |
+Canonical SQL migrations live in [`database/migrations`](database/migrations):
 
-## What's Manual
+1. `001_initial_schema.sql`
+2. `002_ahrefs_tables.sql`
+3. `003_content_gap.sql`
+4. `004_indexes_and_constraints.sql`
+5. `005_rls_policies.sql`
 
-| Task | Frequency | Time |
-|------|-----------|------|
-| Ahrefs browser export | Weekly | ~50 min |
+Helpers:
 
----
+- `database/run_migrations.py` applies all migrations in order using `SUPABASE_DB_URL`.
+- `database/schema.sql` includes all migrations.
+- `database/reset_production_schema.sql` drops all pipeline tables and recreates schema.
+- `database/seed_sample_data.sql` inserts sample smoke-test data.
 
-## Setup (One-Time)
-
-### Step 1: Create GitHub Repository
-
-1. Go to [github.com/new](https://github.com/new)
-2. **Name**: `ztudium-data-pipeline`
-3. **Visibility**: Public ✅ (unlimited Actions minutes)
-4. **Don't** initialize with README (we'll push our code)
-5. Click **Create Repository**
-
-### Step 2: Create Supabase Storage Bucket
-
-1. Go to your Supabase Dashboard → **Storage**
-2. Click **New Bucket**
-3. **Name**: `ahrefs-exports`
-4. **Public bucket**: No (keep private)
-5. Click **Create Bucket**
-
-### Step 3: Add GitHub Secrets
-
-Go to your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-
-Add these secrets one by one:
-
-| Secret Name | Where to Find It |
-|-------------|-------------------|
-| `SUPABASE_URL` | Supabase → Settings → API → Project URL |
-| `SUPABASE_SERVICE_KEY` | Supabase → Settings → API → service_role key |
-| `GOOGLE_CREDENTIALS_JSON` | Copy the ENTIRE contents of `google-credentials.json` |
-| `GSC_PROPERTY_CITIESABC` | Your `.env` file (e.g. `sc-domain:citiesabc.com`) |
-| `GSC_PROPERTY_BUSINESSABC` | Your `.env` file |
-| `GSC_PROPERTY_HEDGETHINK` | Your `.env` file |
-| `GSC_PROPERTY_FASHIONABC` | Your `.env` file |
-| `GSC_PROPERTY_TRADERSDNA` | Your `.env` file |
-| `GSC_PROPERTY_FREEDOMX` | Your `.env` file |
-| `GSC_PROPERTY_WISDOMIA` | Your `.env` file |
-| `GSC_PROPERTY_SPORTSDNA` | Your `.env` file |
-| `GSC_PROPERTY_INTELLIGENTHQ` | Your `.env` file |
-| `GA4_PROPERTY_CITIESABC` | Your `.env` file (numeric ID) |
-| `GA4_PROPERTY_BUSINESSABC` | Your `.env` file |
-| `GA4_PROPERTY_HEDGETHINK` | Your `.env` file |
-| `GA4_PROPERTY_FASHIONABC` | Your `.env` file |
-| `GA4_PROPERTY_TRADERSDNA` | Your `.env` file |
-| `GA4_PROPERTY_FREEDOMX` | Your `.env` file |
-| `GA4_PROPERTY_WISDOMIA` | Your `.env` file |
-| `GA4_PROPERTY_SPORTSDNA` | Your `.env` file |
-| `GA4_PROPERTY_INTELLIGENTHQ` | Your `.env` file |
-
-### Step 4: Push Code to GitHub
+### Run migrations
 
 ```bash
 cd "d:\Ztudium\Data Consolidation\ztudium-data-pipeline"
-git init
-git add .
-git commit -m "Initial pipeline setup"
-git branch -M main
-git remote add origin https://github.com/ztudium/ztudium-data-pipeline.git
-git push -u origin main
+set SUPABASE_DB_URL=postgresql://postgres:<password>@<host>:5432/postgres
+python database/run_migrations.py
 ```
 
-### Step 5: Create Local .env
+## Required Environment Variables
 
-```bash
-copy .env.example .env
-# Edit .env with your actual values (copy from dashboard backend .env)
-```
+Local `.env` and/or GitHub Actions secrets:
 
-### Step 6: Test the Daily Workflow
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+- `SUPABASE_DB_URL` (required for migration runner only)
+- `GOOGLE_CREDENTIALS_JSON` (Actions secret) or `GOOGLE_APPLICATION_CREDENTIALS` (local file path)
+- `GSC_PROPERTY_*` for all websites
+- `GA4_PROPERTY_*` for all websites
 
-1. Go to your repo → **Actions** → **Daily Google Fetch**
-2. Click **Run workflow** → **Run workflow**
-3. Watch the logs — should show data fetched for all 9 sites
+## Workflows
 
----
+### Daily Google Fetch
 
-## Weekly Usage (After Setup)
+- Workflow: `.github/workflows/daily-google-fetch.yml`
+- Timeout: 15 minutes
+- Writes: `daily_metrics`, `website_keywords`, `website_pages`
 
-### 1. Run Ahrefs export (local, ~50 min)
-```bash
-cd "d:\Ztudium\Data Consolidation\ahrefs-automation"
-python run_export.py
-```
+### Ahrefs Processing
 
-### 2. Upload CSVs to cloud + trigger processing
-```bash
-cd "d:\Ztudium\Data Consolidation\ztudium-data-pipeline"
-python scripts/upload_csvs.py
-```
+- Workflow: `.github/workflows/process-ahrefs.yml`
+- Timeout: 60 minutes
+- Writes: `ahrefs_overview`, `ahrefs_referring_domains`, `ahrefs_broken_backlinks`, `ahrefs_competitors`, plus Ahrefs snapshots into `website_keywords` and `website_pages`
 
-That's it! The GitHub Action will download the CSVs, process them, and upload to Supabase.
+## Reliability Controls
 
----
+- Upserts use supabase-py compatible signatures (no `default_to_null`).
+- Batch upsert has chunk retries and row-level fallback.
+- Transient API/network errors use exponential backoff retries.
+- Snapshot date is taken from source filenames and preserved for idempotent reruns.
+- Ingestion run metadata is recorded in `ingestion_runs` when table is present.
 
-## File Structure
+## Security
 
-```
-ztudium-data-pipeline/
-├── .github/
-│   └── workflows/
-│       ├── daily-google-fetch.yml   # Cron: GSC+GA4 → Supabase
-│       └── process-ahrefs.yml       # Triggered: Ahrefs CSVs → Supabase
-├── scripts/
-│   ├── config.py                    # Environment-based config
-│   ├── fetch_google.py              # GSC + GA4 fetcher
-│   ├── upload_csvs.py               # Local → Supabase Storage
-│   └── process_ahrefs.py            # Storage → Parse → Supabase DB
-├── .env.example                     # Template for local .env
-├── .gitignore
-├── requirements.txt
-└── README.md
-```
+- Credentials are read from environment variables only.
+- `.env` and credential files are ignored in `.gitignore`.
+- If a key was ever committed historically, rotate it in Supabase/GitHub immediately.
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| "Credentials not found" | Check `GOOGLE_CREDENTIALS_JSON` secret contains the full JSON |
-| GSC returns 0 rows | Verify service account email is added to each GSC property |
-| GA4 returns 0 rows | Verify service account has Viewer role in each GA4 property |
-| Storage upload fails | Check `ahrefs-exports` bucket exists in Supabase Storage |
-| Workflow not running | Check Actions is enabled in repo Settings → Actions → General |
+- `403 User does not have sufficient permissions`: the service account is missing access on that GSC site or GA4 property.
+- `Invalid property ID`: corresponding `GA4_PROPERTY_*` secret is empty or non-numeric.
+- Ahrefs workflow timeout: verify migration 004 indexes exist; rerun with fewer files if needed.
+- Missing latest data in dashboard: verify frontend is querying latest snapshot date (now enabled for Ahrefs detail tabs).

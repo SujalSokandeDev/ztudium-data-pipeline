@@ -21,11 +21,13 @@ import csv
 import io
 import time
 import json
+import uuid
 import logging
 import argparse
 import tempfile
 import requests
 from datetime import date
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 sys.path.insert(0, os.path.dirname(__file__))
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET
@@ -36,7 +38,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("process_ahrefs")
-_UPSERT_SUPPORTS_DEFAULT_TO_NULL = None
 
 # ── Domain mapping ────────────────────────────────────────────
 WEBSITE_MAP = {
@@ -101,9 +102,49 @@ def categorize_file(filename):
 
 
 def extract_snapshot_date(filename: str) -> str:
-    """Extract YYYY-MM-DD snapshot date from filename."""
+    """Extract YYYY-MM-DD snapshot date from filename.
+
+    This date is the data snapshot date and must be preserved across reruns to
+    keep upserts idempotent. It is intentionally different from ingestion date.
+    """
     m = re.search(r"(20\d{2}-\d{2}-\d{2})", filename)
     return m.group(1) if m else date.today().isoformat()
+
+
+def _is_retryable_api_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    retry_markers = (
+        "429",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "temporarily unavailable",
+        "503",
+        "502",
+        "504",
+    )
+    return any(marker in msg for marker in retry_markers)
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(_is_retryable_api_error),
+)
+def _http_post(url: str, **kwargs):
+    return requests.post(url, **kwargs)
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(_is_retryable_api_error),
+)
+def _http_get(url: str, **kwargs):
+    return requests.get(url, **kwargs)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -123,7 +164,7 @@ def download_from_storage(date_folder: str, temp_dir: str) -> list:
     list_url = f"{SUPABASE_URL}/storage/v1/object/list/{AHREFS_BUCKET}"
 
     # Try root-level first (flat upload)
-    resp = requests.post(
+    resp = _http_post(
         list_url,
         headers=headers,
         json={"prefix": "", "limit": 200},
@@ -141,7 +182,7 @@ def download_from_storage(date_folder: str, temp_dir: str) -> list:
     # If no flat files, try date-prefixed folder
     if not file_items:
         logger.info("No root-level files, trying prefix: %s/", date_folder)
-        resp = requests.post(
+        resp = _http_post(
             list_url,
             headers=headers,
             json={"prefix": f"{date_folder}/", "limit": 200},
@@ -167,7 +208,7 @@ def download_from_storage(date_folder: str, temp_dir: str) -> list:
         download_url = f"{SUPABASE_URL}/storage/v1/object/{AHREFS_BUCKET}/{storage_path}"
 
         try:
-            resp = requests.get(download_url, headers=headers, timeout=120)
+            resp = _http_get(download_url, headers=headers, timeout=120)
             if resp.status_code == 200:
                 local_path = os.path.join(temp_dir, name)
                 with open(local_path, "wb") as f:
@@ -178,7 +219,7 @@ def download_from_storage(date_folder: str, temp_dir: str) -> list:
             else:
                 logger.error("  ❌ %s — HTTP %d", name, resp.status_code)
         except Exception as e:
-            logger.error("  ❌ %s — %s", name, str(e)[:100])
+            logger.error("  ❌ %s — %s", name, str(e)[:100], exc_info=True)
 
     return downloaded
 
@@ -261,6 +302,7 @@ def parse_overview_txt(filepath, website_name):
     return {
         "date": file_date,
         "website": website_name,
+        "source_file": os.path.basename(filepath),
         "domain": extract(r"Domain:\s*(\S+)"),
         "dr": dr_val,
         "dr_delta": dr_delta,
@@ -293,7 +335,13 @@ def parse_organic_keywords(filepath, website):
             "position": _parse_number(row.get("Position", row.get("Current position", 0))),
             "traffic": _parse_number(row.get("Traffic", row.get("Estimated traffic", 0))),
         })
-    return {"website": website, "date": snapshot_date, "total": len(rows), "keywords": keywords}
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "keywords": keywords,
+    }
 
 
 def parse_referring_domains(filepath, website):
@@ -309,7 +357,13 @@ def parse_referring_domains(filepath, website):
             "links_to_target": _parse_number(row.get("Links to target", 0)),
             "first_seen": row.get("First seen", ""),
         })
-    return {"website": website, "date": snapshot_date, "total": len(rows), "domains": domains}
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "domains": domains,
+    }
 
 
 def parse_top_pages(filepath, website):
@@ -324,7 +378,13 @@ def parse_top_pages(filepath, website):
             "keywords_count": _parse_number(row.get("Keywords", row.get("Number of keywords", 0))),
             "top_keyword": row.get("Top keyword", ""),
         })
-    return {"website": website, "date": snapshot_date, "total": len(rows), "pages": pages}
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "pages": pages,
+    }
 
 
 def parse_broken_backlinks(filepath, website):
@@ -340,7 +400,13 @@ def parse_broken_backlinks(filepath, website):
             "anchor": row.get("Anchor", row.get("Link anchor", "")),
             "dr": _parse_number(row.get("Domain Rating", row.get("DR", 0))),
         })
-    return {"website": website, "date": snapshot_date, "total": len(rows), "links": links}
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "links": links,
+    }
 
 
 def parse_competitors(filepath, website):
@@ -355,7 +421,13 @@ def parse_competitors(filepath, website):
             "share": row.get("Share", ""),
             "competitor_keywords": _parse_number(row.get("SE keywords", row.get("Keywords", 0))),
         })
-    return {"website": website, "date": snapshot_date, "total": len(rows), "competitors": competitors}
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "competitors": competitors,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -403,8 +475,8 @@ def batch_upsert(client, table, rows, conflict_cols):
                 try:
                     client.table(table).upsert([row], on_conflict=conflict_cols).execute()
                     upserted += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("  %s row upsert failed: %s", table, str(e)[:180])
                 time.sleep(0.05)
 
         # Steady pacing to avoid hitting API limits.
@@ -430,35 +502,78 @@ def _is_retryable_upsert_error(exc: Exception) -> bool:
 
 
 def _upsert_chunk(client, table: str, chunk: list, conflict_cols: str):
-    """Upsert one chunk, with compatibility handling for older Supabase clients."""
-    global _UPSERT_SUPPORTS_DEFAULT_TO_NULL
+    """Upsert one chunk using supabase-py compatible parameters."""
+    client.table(table).upsert(chunk, on_conflict=conflict_cols).execute()
 
-    base_kwargs = {"on_conflict": conflict_cols}
 
-    if _UPSERT_SUPPORTS_DEFAULT_TO_NULL is False:
-        client.table(table).upsert(chunk, **base_kwargs).execute()
-        return
+def _start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
+    """Create a run record; best effort only."""
+    from supabase import create_client
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
 
     try:
-        client.table(table).upsert(chunk, on_conflict=conflict_cols, default_to_null=True).execute()
-        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = True
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        run_id = str(uuid.uuid4())
+        payload = {
+            "id": run_id,
+            "source": source,
+            "status": "running",
+            "websites_attempted": websites_attempted,
+        }
+        client.table("ingestion_runs").insert(payload).execute()
+        return run_id
+    except Exception as e:
+        logger.warning("Could not start ingestion run tracking: %s", str(e)[:200])
+        return None
+
+
+def _finish_ingestion_run(
+    run_id: str | None,
+    status: str,
+    websites_succeeded: list[str],
+    websites_failed: list[str],
+    error_details: dict,
+    duration_seconds: int,
+):
+    """Finalize run tracking; best effort only."""
+    if not run_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+
+    from supabase import create_client
+
+    try:
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        payload = {
+            "status": status,
+            "websites_succeeded": websites_succeeded,
+            "websites_failed": websites_failed,
+            "error_details": error_details,
+            "duration_seconds": duration_seconds,
+        }
+        client.table("ingestion_runs").update(payload).eq("id", run_id).execute()
+    except Exception as e:
+        logger.warning("Could not finalize ingestion run tracking: %s", str(e)[:200])
+
+
+_COLUMN_SUPPORT_CACHE = {}
+
+
+def _supports_column(client, table: str, column: str) -> bool:
+    key = f"{table}.{column}"
+    if key in _COLUMN_SUPPORT_CACHE:
+        return _COLUMN_SUPPORT_CACHE[key]
+    try:
+        client.table(table).select(column).limit(1).execute()
+        _COLUMN_SUPPORT_CACHE[key] = True
     except Exception as e:
         msg = str(e).lower()
-        unsupported_default_to_null = (
-            "default_to_null" in msg and
-            ("unexpected keyword" in msg or "got an unexpected keyword argument" in msg)
-        )
-        if not unsupported_default_to_null:
-            raise
-
-        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = False
-        logger.warning(
-            "Supabase client does not support default_to_null; using compatible upsert mode."
-        )
-        client.table(table).upsert(chunk, **base_kwargs).execute()
+        _COLUMN_SUPPORT_CACHE[key] = not ("column" in msg and "does not exist" in msg)
+    return _COLUMN_SUPPORT_CACHE[key]
 
 
-def upload_parsed_data(parsed_data):
+def upload_parsed_data(parsed_data, run_id: str | None = None):
     """Upload all parsed Ahrefs data to Supabase."""
     from supabase import create_client
 
@@ -466,14 +581,31 @@ def upload_parsed_data(parsed_data):
         logger.error("Supabase credentials not set")
         return
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    today_str = date.today().isoformat()
+    overview_has_source_file = _supports_column(client, "ahrefs_overview", "source_file")
+    ref_domains_has_source_file = _supports_column(client, "ahrefs_referring_domains", "source_file")
+    broken_backlinks_has_source_file = _supports_column(client, "ahrefs_broken_backlinks", "source_file")
+    overview_has_ingestion_run_id = _supports_column(client, "ahrefs_overview", "ingestion_run_id")
+    keyword_has_ingestion_run_id = _supports_column(client, "website_keywords", "ingestion_run_id")
+    pages_has_ingestion_run_id = _supports_column(client, "website_pages", "ingestion_run_id")
+    ref_domains_has_ingestion_run_id = _supports_column(client, "ahrefs_referring_domains", "ingestion_run_id")
+    broken_backlinks_has_ingestion_run_id = _supports_column(client, "ahrefs_broken_backlinks", "ingestion_run_id")
+    competitors_has_ingestion_run_id = _supports_column(client, "ahrefs_competitors", "ingestion_run_id")
 
     # Overviews
     ov_rows = []
     for ws, data in parsed_data.items():
         ov = data.get("overview")
         if ov:
-            ov_rows.append({k: v for k, v in ov.items() if v is not None})
+            snapshot_date = ov.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_overview skipped for %s (missing snapshot date)", ws)
+                continue
+            row = {k: v for k, v in ov.items() if v is not None}
+            if run_id and overview_has_ingestion_run_id:
+                row["ingestion_run_id"] = run_id
+            if not overview_has_source_file:
+                row.pop("source_file", None)
+            ov_rows.append(row)
     c = batch_upsert(client, "ahrefs_overview", ov_rows, "date,website")
     logger.info("  ahrefs_overview: %d upserted", c)
 
@@ -482,7 +614,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         ok = data.get("organic_keywords")
         if ok:
-            snapshot_date = ok.get("date", today_str)
+            snapshot_date = ok.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_keywords skipped for %s (missing snapshot date)", ws)
+                continue
             for kw in ok.get("keywords", [])[:200]:
                 kw_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws, "keyword": kw.get("keyword"),
@@ -491,6 +626,8 @@ def upload_parsed_data(parsed_data):
                     "keyword_difficulty": kw.get("kd"), "traffic_estimate": kw.get("traffic"),
                     "source": "ahrefs",
                 }.items() if v is not None})
+                if run_id and keyword_has_ingestion_run_id:
+                    kw_rows[-1]["ingestion_run_id"] = run_id
     c = batch_upsert(client, "website_keywords", kw_rows, "date,website,keyword,source")
     logger.info("  ahrefs_keywords: %d upserted", c)
 
@@ -499,7 +636,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         tp = data.get("top_pages")
         if tp:
-            snapshot_date = tp.get("date", today_str)
+            snapshot_date = tp.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_pages skipped for %s (missing snapshot date)", ws)
+                continue
             for pg in tp.get("pages", [])[:100]:
                 pg_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws, "url": pg.get("url"),
@@ -507,6 +647,8 @@ def upload_parsed_data(parsed_data):
                     "keywords_count": pg.get("keywords_count"), "top_keyword": pg.get("top_keyword"),
                     "source": "ahrefs",
                 }.items() if v is not None})
+                if run_id and pages_has_ingestion_run_id:
+                    pg_rows[-1]["ingestion_run_id"] = run_id
     c = batch_upsert(client, "website_pages", pg_rows, "date,website,url,source")
     logger.info("  ahrefs_pages: %d upserted", c)
 
@@ -515,13 +657,22 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         rd = data.get("referring_domains")
         if rd:
-            snapshot_date = rd.get("date", today_str)
+            snapshot_date = rd.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_referring_domains skipped for %s (missing snapshot date)", ws)
+                continue
             for dom in rd.get("domains", [])[:500]:
-                rd_rows.append({k: v for k, v in {
+                rd_row = {k: v for k, v in {
                     "date": snapshot_date, "website": ws, "domain": dom.get("domain"),
                     "dr": dom.get("dr"), "dofollow_links": dom.get("dofollow_links"),
                     "links_to_target": dom.get("links_to_target"), "first_seen": dom.get("first_seen"),
-                }.items() if v is not None})
+                    "source_file": rd.get("source_file"),
+                }.items() if v is not None}
+                if not ref_domains_has_source_file:
+                    rd_row.pop("source_file", None)
+                if run_id and ref_domains_has_ingestion_run_id:
+                    rd_row["ingestion_run_id"] = run_id
+                rd_rows.append(rd_row)
     c = batch_upsert(client, "ahrefs_referring_domains", rd_rows, "date,website,domain")
     logger.info("  ahrefs_referring_domains: %d upserted", c)
 
@@ -530,19 +681,28 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         bb = data.get("broken_backlinks")
         if bb:
-            snapshot_date = bb.get("date", today_str)
+            snapshot_date = bb.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_broken_backlinks skipped for %s (missing snapshot date)", ws)
+                continue
             for link in bb.get("links", [])[:200]:
                 http_code = None
                 try:
                     http_code = int(link.get("http_code", 0))
                 except (ValueError, TypeError):
                     pass
-                bb_rows.append({k: v for k, v in {
+                bb_row = {k: v for k, v in {
                     "date": snapshot_date, "website": ws,
                     "referring_page": link.get("referring_url"), "target_url": link.get("target_url"),
                     "http_code": http_code, "anchor_text": link.get("anchor"),
                     "ref_domain_dr": link.get("dr"),
-                }.items() if v is not None})
+                    "source_file": bb.get("source_file"),
+                }.items() if v is not None}
+                if not broken_backlinks_has_source_file:
+                    bb_row.pop("source_file", None)
+                if run_id and broken_backlinks_has_ingestion_run_id:
+                    bb_row["ingestion_run_id"] = run_id
+                bb_rows.append(bb_row)
     c = batch_upsert(client, "ahrefs_broken_backlinks", bb_rows, "date,website,referring_page")
     logger.info("  ahrefs_broken_backlinks: %d upserted", c)
 
@@ -551,7 +711,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         comp = data.get("organic_competitors")
         if comp:
-            snapshot_date = comp.get("date", today_str)
+            snapshot_date = comp.get("date")
+            if not snapshot_date:
+                logger.warning("  ahrefs_competitors skipped for %s (missing snapshot date)", ws)
+                continue
             for rank, c_item in enumerate(comp.get("competitors", []), 1):
                 comp_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws,
@@ -561,6 +724,8 @@ def upload_parsed_data(parsed_data):
                     "competitor_keywords": c_item.get("competitor_keywords"),
                     "rank_order": rank,
                 }.items() if v is not None})
+                if run_id and competitors_has_ingestion_run_id:
+                    comp_rows[-1]["ingestion_run_id"] = run_id
     c = batch_upsert(client, "ahrefs_competitors", comp_rows, "date,website,competitor_domain")
     logger.info("  ahrefs_competitors: %d upserted", c)
 
@@ -582,6 +747,7 @@ def main():
     print("  PROCESS AHREFS CSVs")
     print(f"  Date folder: {args.date_folder}")
     print("=" * 60)
+    run_started = time.time()
 
     # Get files
     if args.local_dir:
@@ -601,6 +767,7 @@ def main():
     # Parse files
     print("\n--- Parsing files ---")
     parsed_data = {}
+    parse_errors = {}
 
     for filepath in sorted(files):
         filename = os.path.basename(filepath)
@@ -630,17 +797,47 @@ def main():
 
             logger.info("  ✅ %s → %s / %s", filename, website, category)
         except Exception as e:
-            logger.error("  ❌ %s — %s", filename, str(e)[:80])
+            logger.error("  ❌ %s — %s", filename, str(e)[:80], exc_info=True)
+            parse_errors[filename] = str(e)
 
     # Summary
     print(f"\nParsed data for {len(parsed_data)} websites:")
     for ws in sorted(parsed_data.keys()):
         sections = list(parsed_data[ws].keys())
         print(f"  {ws}: {', '.join(sections)}")
+    websites_attempted = sorted(parsed_data.keys())
+    run_id = _start_ingestion_run("ahrefs", websites_attempted)
 
     # Upload to Supabase
     print("\n--- Uploading to Supabase ---")
-    upload_parsed_data(parsed_data)
+    status = "success"
+    websites_succeeded = []
+    websites_failed = []
+    try:
+        upload_parsed_data(parsed_data, run_id=run_id)
+        for ws, sections in parsed_data.items():
+            if sections:
+                websites_succeeded.append(ws)
+            else:
+                websites_failed.append(ws)
+        if websites_failed and websites_succeeded:
+            status = "partial"
+        elif websites_failed and not websites_succeeded:
+            status = "failed"
+    except Exception as e:
+        status = "failed"
+        parse_errors["upload"] = str(e)
+        raise
+    finally:
+        duration_seconds = int(time.time() - run_started)
+        _finish_ingestion_run(
+            run_id=run_id,
+            status=status,
+            websites_succeeded=sorted(websites_succeeded),
+            websites_failed=sorted(websites_failed),
+            error_details=parse_errors,
+            duration_seconds=duration_seconds,
+        )
 
     print("\n✅ Done!")
 

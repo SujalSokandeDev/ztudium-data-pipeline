@@ -10,8 +10,10 @@ import os
 import sys
 import logging
 import time
+import uuid
 from datetime import date, timedelta
 from collections import defaultdict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 # Add scripts dir to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -23,7 +25,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("fetch_google")
-_UPSERT_SUPPORTS_DEFAULT_TO_NULL = None
 
 END_DATE = date.today() - timedelta(days=2)
 START_DATE = END_DATE - timedelta(days=30)
@@ -35,6 +36,43 @@ START_DATE = END_DATE - timedelta(days=30)
 
 gsc_service = None
 ga4_client = None
+
+
+def _is_retryable_api_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    retry_markers = (
+        "429",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "temporarily unavailable",
+        "503",
+        "502",
+        "504",
+        "internal",
+    )
+    return any(marker in msg for marker in retry_markers)
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(_is_retryable_api_error),
+)
+def _execute_gsc_query(site_url: str, body: dict):
+    return gsc_service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(_is_retryable_api_error),
+)
+def _execute_ga4_report(req):
+    return ga4_client.run_report(req)
 
 
 def init_google_apis():
@@ -78,15 +116,15 @@ def fetch_gsc_daily(name, gsc_prop):
     if not gsc_service or not gsc_prop:
         return []
     try:
-        resp = gsc_service.searchanalytics().query(
-            siteUrl=gsc_prop,
-            body={
+        resp = _execute_gsc_query(
+            gsc_prop,
+            {
                 "startDate": START_DATE.isoformat(),
                 "endDate": END_DATE.isoformat(),
                 "dimensions": ["date"],
                 "rowLimit": 500,
             },
-        ).execute()
+        )
         rows = []
         for row in resp.get("rows", []):
             rows.append({
@@ -100,7 +138,7 @@ def fetch_gsc_daily(name, gsc_prop):
         logger.info("  GSC daily: %d rows for %s", len(rows), name)
         return rows
     except Exception as e:
-        logger.error("  GSC daily failed for %s: %s", name, e)
+        logger.error("  GSC daily failed for %s: %s", name, e, exc_info=True)
         return []
 
 
@@ -109,15 +147,15 @@ def fetch_gsc_keywords(name, gsc_prop):
     if not gsc_service or not gsc_prop:
         return []
     try:
-        resp = gsc_service.searchanalytics().query(
-            siteUrl=gsc_prop,
-            body={
+        resp = _execute_gsc_query(
+            gsc_prop,
+            {
                 "startDate": START_DATE.isoformat(),
                 "endDate": END_DATE.isoformat(),
                 "dimensions": ["query"],
                 "rowLimit": 100,
             },
-        ).execute()
+        )
         keywords = []
         for row in resp.get("rows", []):
             keywords.append({
@@ -130,7 +168,7 @@ def fetch_gsc_keywords(name, gsc_prop):
         logger.info("  GSC keywords: %d for %s", len(keywords), name)
         return keywords
     except Exception as e:
-        logger.error("  GSC keywords failed for %s: %s", name, e)
+        logger.error("  GSC keywords failed for %s: %s", name, e, exc_info=True)
         return []
 
 
@@ -139,15 +177,15 @@ def fetch_gsc_pages(name, gsc_prop):
     if not gsc_service or not gsc_prop:
         return []
     try:
-        resp = gsc_service.searchanalytics().query(
-            siteUrl=gsc_prop,
-            body={
+        resp = _execute_gsc_query(
+            gsc_prop,
+            {
                 "startDate": START_DATE.isoformat(),
                 "endDate": END_DATE.isoformat(),
                 "dimensions": ["page"],
                 "rowLimit": 100,
             },
-        ).execute()
+        )
         pages = []
         for row in resp.get("rows", []):
             pages.append({
@@ -160,7 +198,7 @@ def fetch_gsc_pages(name, gsc_prop):
         logger.info("  GSC pages: %d for %s", len(pages), name)
         return pages
     except Exception as e:
-        logger.error("  GSC pages failed for %s: %s", name, e)
+        logger.error("  GSC pages failed for %s: %s", name, e, exc_info=True)
         return []
 
 
@@ -189,7 +227,7 @@ def fetch_ga4_daily(name, ga4_id):
                 Metric(name="bounceRate"),
             ],
         )
-        resp_all = ga4_client.run_report(req_all)
+        resp_all = _execute_ga4_report(req_all)
 
         all_by_date = {}
         for row in resp_all.rows:
@@ -222,22 +260,22 @@ def fetch_ga4_daily(name, ga4_id):
             ),
         )
         try:
-            resp_org = ga4_client.run_report(req_organic)
+            resp_org = _execute_ga4_report(req_organic)
             for row in resp_org.rows:
                 raw = row.dimension_values[0].value
                 d = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
                 if d in all_by_date:
                     all_by_date[d]["ga_organic_sessions"] = int(row.metric_values[0].value)
                     all_by_date[d]["ga_organic_users"] = int(row.metric_values[1].value)
-        except Exception:
-            pass  # Organic filter may not be available
+        except Exception as e:
+            logger.warning("  GA4 organic segment unavailable for %s: %s", name, e)
 
         rows = sorted(all_by_date.values(), key=lambda r: r["date"])
         logger.info("  GA4 daily: %d rows for %s", len(rows), name)
         return rows
 
     except Exception as e:
-        logger.error("  GA4 daily failed for %s: %s", name, e)
+        logger.error("  GA4 daily failed for %s: %s", name, e, exc_info=True)
         return []
 
 
@@ -285,8 +323,8 @@ def batch_upsert(client, table, rows, conflict_cols):
                 try:
                     client.table(table).upsert([row], on_conflict=conflict_cols).execute()
                     upserted += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("  %s row upsert failed: %s", table, str(e)[:180])
                 time.sleep(0.05)
 
         time.sleep(0.2)
@@ -311,35 +349,78 @@ def _is_retryable_upsert_error(exc: Exception) -> bool:
 
 
 def _upsert_chunk(client, table: str, chunk: list, conflict_cols: str):
-    """Upsert one chunk, with compatibility handling for older Supabase clients."""
-    global _UPSERT_SUPPORTS_DEFAULT_TO_NULL
+    """Upsert one chunk using supabase-py compatible parameters."""
+    client.table(table).upsert(chunk, on_conflict=conflict_cols).execute()
 
-    base_kwargs = {"on_conflict": conflict_cols}
 
-    if _UPSERT_SUPPORTS_DEFAULT_TO_NULL is False:
-        client.table(table).upsert(chunk, **base_kwargs).execute()
-        return
+def _start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
+    """Create a run record; do not fail pipeline if tracking table is unavailable."""
+    from supabase import create_client
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
 
     try:
-        client.table(table).upsert(chunk, on_conflict=conflict_cols, default_to_null=True).execute()
-        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = True
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        run_id = str(uuid.uuid4())
+        payload = {
+            "id": run_id,
+            "source": source,
+            "status": "running",
+            "websites_attempted": websites_attempted,
+        }
+        client.table("ingestion_runs").insert(payload).execute()
+        return run_id
+    except Exception as e:
+        logger.warning("Could not start ingestion run tracking: %s", str(e)[:200])
+        return None
+
+
+def _finish_ingestion_run(
+    run_id: str | None,
+    status: str,
+    websites_succeeded: list[str],
+    websites_failed: list[str],
+    error_details: dict,
+    duration_seconds: int,
+):
+    """Finalize run tracking; best effort only."""
+    if not run_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+
+    from supabase import create_client
+
+    try:
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        payload = {
+            "status": status,
+            "websites_succeeded": websites_succeeded,
+            "websites_failed": websites_failed,
+            "error_details": error_details,
+            "duration_seconds": duration_seconds,
+        }
+        client.table("ingestion_runs").update(payload).eq("id", run_id).execute()
+    except Exception as e:
+        logger.warning("Could not finalize ingestion run tracking: %s", str(e)[:200])
+
+
+_COLUMN_SUPPORT_CACHE = {}
+
+
+def _supports_column(client, table: str, column: str) -> bool:
+    key = f"{table}.{column}"
+    if key in _COLUMN_SUPPORT_CACHE:
+        return _COLUMN_SUPPORT_CACHE[key]
+    try:
+        client.table(table).select(column).limit(1).execute()
+        _COLUMN_SUPPORT_CACHE[key] = True
     except Exception as e:
         msg = str(e).lower()
-        unsupported_default_to_null = (
-            "default_to_null" in msg and
-            ("unexpected keyword" in msg or "got an unexpected keyword argument" in msg)
-        )
-        if not unsupported_default_to_null:
-            raise
-
-        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = False
-        logger.warning(
-            "Supabase client does not support default_to_null; using compatible upsert mode."
-        )
-        client.table(table).upsert(chunk, **base_kwargs).execute()
+        _COLUMN_SUPPORT_CACHE[key] = not ("column" in msg and "does not exist" in msg)
+    return _COLUMN_SUPPORT_CACHE[key]
 
 
-def store_in_supabase(all_data, keywords_data, pages_data):
+def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None):
     """Upload all fetched data to Supabase."""
     from supabase import create_client
 
@@ -347,6 +428,7 @@ def store_in_supabase(all_data, keywords_data, pages_data):
         logger.warning("Supabase credentials not set, skipping upload")
         return
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    daily_metrics_has_ingestion_run_id = _supports_column(client, "daily_metrics", "ingestion_run_id")
     today_str = date.today().isoformat()
 
     # Daily metrics
@@ -368,6 +450,8 @@ def store_in_supabase(all_data, keywords_data, pages_data):
                 "ga_bounce_rate": row.get("ga_bounce_rate"),
                 "data_source": "api",
             }
+            if run_id and daily_metrics_has_ingestion_run_id:
+                db_row["ingestion_run_id"] = run_id
             dm_rows.append({k: v for k, v in db_row.items() if v is not None})
     c = batch_upsert(client, "daily_metrics", dm_rows, "date,website")
     logger.info("  daily_metrics: %d/%d upserted", c, len(dm_rows))
@@ -410,10 +494,16 @@ def main():
     print("=" * 60)
 
     init_google_apis()
+    run_started = time.time()
+    all_website_names = [ws["name"] for ws in WEBSITES]
+    run_id = _start_ingestion_run("google", all_website_names)
 
     all_data = {}
     keywords_data = {}
     pages_data = {}
+    websites_succeeded = []
+    websites_failed = []
+    error_details = {}
 
     for ws in WEBSITES:
         name = ws["name"]
@@ -423,9 +513,11 @@ def main():
         print(f"\n  {name}:")
         merged = defaultdict(lambda: {"website": name})
 
-        for row in fetch_gsc_daily(name, gsc_prop):
+        gsc_daily_rows = fetch_gsc_daily(name, gsc_prop)
+        for row in gsc_daily_rows:
             merged[row["date"]].update(row)
-        for row in fetch_ga4_daily(name, ga4_id):
+        ga4_daily_rows = fetch_ga4_daily(name, ga4_id)
+        for row in ga4_daily_rows:
             merged[row["date"]].update(row)
 
         if merged:
@@ -439,9 +531,36 @@ def main():
         if pgs:
             pages_data[name] = pgs
 
+        has_any_payload = bool(gsc_daily_rows or ga4_daily_rows or kws or pgs)
+        if has_any_payload:
+            websites_succeeded.append(name)
+        else:
+            websites_failed.append(name)
+            error_details[name] = "No GSC/GA4 payload received"
+
     # Upload to Supabase
     print("\n--- Uploading to Supabase ---")
-    store_in_supabase(all_data, keywords_data, pages_data)
+    status = "success"
+    try:
+        store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id)
+        if websites_failed and websites_succeeded:
+            status = "partial"
+        elif websites_failed and not websites_succeeded:
+            status = "failed"
+    except Exception as e:
+        status = "failed"
+        error_details["upload"] = str(e)
+        raise
+    finally:
+        duration_seconds = int(time.time() - run_started)
+        _finish_ingestion_run(
+            run_id=run_id,
+            status=status,
+            websites_succeeded=websites_succeeded,
+            websites_failed=websites_failed,
+            error_details=error_details,
+            duration_seconds=duration_seconds,
+        )
 
     # Summary
     print("\n" + "=" * 60)

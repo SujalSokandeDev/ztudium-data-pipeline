@@ -36,6 +36,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("process_ahrefs")
+_UPSERT_SUPPORTS_DEFAULT_TO_NULL = None
 
 # ── Domain mapping ────────────────────────────────────────────
 WEBSITE_MAP = {
@@ -333,21 +334,89 @@ def batch_upsert(client, table, rows, conflict_cols):
 
     upserted = 0
     chunk_size = 50
+    chunk_retries = 3
     for i in range(0, len(normalized), chunk_size):
         chunk = normalized[i : i + chunk_size]
-        try:
-            client.table(table).upsert(chunk, on_conflict=conflict_cols, default_to_null=True).execute()
-            upserted += len(chunk)
-        except Exception as e:
-            logger.error("  %s batch error: %s", table, str(e)[:80])
+        chunk_ok = False
+
+        for attempt in range(1, chunk_retries + 1):
+            try:
+                _upsert_chunk(client, table, chunk, conflict_cols)
+                upserted += len(chunk)
+                chunk_ok = True
+                break
+            except Exception as e:
+                msg = str(e)[:200]
+                if attempt < chunk_retries and _is_retryable_upsert_error(e):
+                    wait_s = 1.0 * attempt
+                    logger.warning(
+                        "  %s chunk retry %d/%d after transient error: %s",
+                        table, attempt, chunk_retries, msg
+                    )
+                    time.sleep(wait_s)
+                    continue
+                logger.error("  %s batch error: %s", table, msg)
+                break
+
+        if not chunk_ok:
+            # Fallback: row-wise upsert for resilience, still rate-limited.
             for row in chunk:
                 try:
                     client.table(table).upsert([row], on_conflict=conflict_cols).execute()
                     upserted += 1
                 except Exception:
                     pass
-        time.sleep(0.5)
+                time.sleep(0.05)
+
+        # Steady pacing to avoid hitting API limits.
+        time.sleep(0.2)
     return upserted
+
+
+def _is_retryable_upsert_error(exc: Exception) -> bool:
+    """Detect transient transport/rate-limit errors that benefit from retry."""
+    msg = str(exc).lower()
+    retry_markers = (
+        "429",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "temporarily unavailable",
+        "503",
+        "502",
+        "504",
+    )
+    return any(m in msg for m in retry_markers)
+
+
+def _upsert_chunk(client, table: str, chunk: list, conflict_cols: str):
+    """Upsert one chunk, with compatibility handling for older Supabase clients."""
+    global _UPSERT_SUPPORTS_DEFAULT_TO_NULL
+
+    base_kwargs = {"on_conflict": conflict_cols}
+
+    if _UPSERT_SUPPORTS_DEFAULT_TO_NULL is False:
+        client.table(table).upsert(chunk, **base_kwargs).execute()
+        return
+
+    try:
+        client.table(table).upsert(chunk, on_conflict=conflict_cols, default_to_null=True).execute()
+        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = True
+    except Exception as e:
+        msg = str(e).lower()
+        unsupported_default_to_null = (
+            "default_to_null" in msg and
+            ("unexpected keyword" in msg or "got an unexpected keyword argument" in msg)
+        )
+        if not unsupported_default_to_null:
+            raise
+
+        _UPSERT_SUPPORTS_DEFAULT_TO_NULL = False
+        logger.warning(
+            "Supabase client does not support default_to_null; using compatible upsert mode."
+        )
+        client.table(table).upsert(chunk, **base_kwargs).execute()
 
 
 def upload_parsed_data(parsed_data):

@@ -221,6 +221,25 @@ def _as_float(value, default=0.0):
         return default
 
 
+def _sanitize_keyword_payload(row: dict) -> dict:
+    """Normalize payload types so inserts work against strict/int drifted schemas."""
+    return {
+        "date": row["date"],
+        "website": row["website"],
+        "keyword": row["keyword"],
+        # Keep integer-safe fields as integers to avoid 22P02 on legacy integer schemas.
+        "volume": _as_int(row.get("volume"), 0),
+        "kd": _as_int(row.get("kd"), 0),
+        "cpc": round(_as_float(row.get("cpc"), 0.0), 2),
+        "serp_features": row.get("serp_features"),
+        "intent": row.get("intent"),
+        "is_easy_win": bool(row.get("is_easy_win", False)),
+        "opportunity_score": round(_as_float(row.get("opportunity_score"), 0.0), 1),
+        "cluster": row.get("cluster"),
+        "competitors": row.get("competitors") or [],
+    }
+
+
 def _detect_intent(keyword: str) -> str:
     tokens = set(re.findall(r"[a-z0-9]+", keyword.lower()))
     if tokens.intersection(INTENT_SIGNALS["commercial"]):
@@ -313,7 +332,7 @@ def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict]]:
             continue
 
         volume = _as_int(row.get("Volume"), 0)
-        kd = _as_float(row.get("KD"), 100.0)
+        kd = _as_int(row.get("KD"), 100)
         cpc = _as_float(row.get("CPC"), 0.0)
         serp_features = row.get("SERP features") or row.get("SERP Features") or None
         intent = _detect_intent(keyword)
@@ -335,7 +354,7 @@ def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict]]:
             )
 
         is_easy_win = volume >= 1000 and kd < 5
-        score = _calc_opportunity_score(volume, kd, comp_count)
+        score = _calc_opportunity_score(volume, float(kd), comp_count)
         parsed.append(
             {
                 "date": snapshot_date,
@@ -459,20 +478,7 @@ def batch_upsert(client, rows: list[dict], run_id: str | None = None) -> int:
     has_run_id = _supports_column(client, "content_gap_keywords", "ingestion_run_id")
     normalized = []
     for row in rows:
-        payload = {
-            "date": row["date"],
-            "website": row["website"],
-            "keyword": row["keyword"],
-            "volume": row.get("volume"),
-            "kd": row.get("kd"),
-            "cpc": row.get("cpc"),
-            "serp_features": row.get("serp_features"),
-            "intent": row.get("intent"),
-            "is_easy_win": row.get("is_easy_win", False),
-            "opportunity_score": row.get("opportunity_score"),
-            "cluster": row.get("cluster"),
-            "competitors": row.get("competitors") or [],
-        }
+        payload = _sanitize_keyword_payload(row)
         if has_source_file:
             payload["source_file"] = row.get("source_file")
         if run_id and has_run_id:
@@ -505,7 +511,14 @@ def batch_upsert(client, rows: list[dict], run_id: str | None = None) -> int:
                     ).execute()
                     inserted += 1
                 except Exception as exc:
-                    logger.error("Row upsert failed for keyword=%s: %s", row.get("keyword"), str(exc)[:200])
+                    logger.error(
+                        "Row upsert failed for keyword=%s (volume=%s kd=%s cpc=%s): %s",
+                        row.get("keyword"),
+                        row.get("volume"),
+                        row.get("kd"),
+                        row.get("cpc"),
+                        str(exc)[:200],
+                    )
                 time.sleep(0.04)
         time.sleep(0.15)
     return inserted

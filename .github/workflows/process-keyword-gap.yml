@@ -1,0 +1,44 @@
+name: Process Keyword Gap CSVs
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_folder:
+        description: "Date folder in Supabase Storage (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  process-keyword-gap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine date folder
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.date_folder }}" ]; then
+            echo "folder=${{ github.event.inputs.date_folder }}" >> $GITHUB_OUTPUT
+          else
+            echo "folder=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Process keyword gap CSVs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/process_keyword_gap.py --date-folder ${{ steps.date.outputs.folder }}

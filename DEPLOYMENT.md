@@ -11,6 +11,7 @@
 3. Apply DB migrations (001-005).
 4. Validate RLS policies and anon read access for dashboard tables.
 5. Run both workflows manually once and confirm writes.
+6. Create Supabase Storage bucket `keyword_gap` (private), then run keyword-gap workflow once.
 
 ## Database Migration Commands
 
@@ -48,6 +49,7 @@ Set these in frontend deployment environment:
 - `GITHUB_REF` (default `main`)
 - `GITHUB_GOOGLE_WORKFLOW` (default `daily-google-fetch.yml`)
 - `GITHUB_AHREFS_WORKFLOW` (default `process-ahrefs.yml`)
+- `GITHUB_KEYWORD_GAP_WORKFLOW` (optional, default `process-keyword-gap.yml`)
 
 ## Security Hardening
 

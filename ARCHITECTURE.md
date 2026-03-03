@@ -21,7 +21,12 @@ Option A is implemented: **frontend reads Supabase directly** for dashboard data
 - Upserts snapshot-scoped rows by `(date, website, ...)` keys.
 - Uses source-file lineage fields when schema supports them.
 
-3. Frontend (`SEO-Data-Consolidation-Dashboard`)
+3. `scripts/process_keyword_gap.py`
+- Downloads keyword-gap CSVs from Supabase Storage bucket `keyword_gap`.
+- Parses keyword opportunities and upserts into `content_gap_keywords`.
+- Applies snapshot-date inserts from filename and dedupe by `(date, website, keyword)` before upsert.
+
+4. Frontend (`SEO-Data-Consolidation-Dashboard`)
 - Direct Supabase queries for all data views.
 - Snapshot-scoped detail tabs to prevent cross-date duplicates.
 - Date-range controls persist in URL query params.
@@ -36,4 +41,5 @@ Option A is implemented: **frontend reads Supabase directly** for dashboard data
 
 - Daily schedule: run Google fetch workflow.
 - Weekly/manual: upload Ahrefs exports -> run Ahrefs process workflow.
+- Weekly/manual: upload keyword-gap exports -> run keyword-gap process workflow.
 - Monitoring: inspect `ingestion_runs` + workflow logs for partial/failed runs.

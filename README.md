@@ -6,6 +6,7 @@ Automated ingestion for Google (GSC + GA4) and Ahrefs exports into Supabase.
 
 - `daily-google-fetch.yml` runs `scripts/fetch_google.py` (API pull -> Supabase upsert).
 - `process-ahrefs.yml` runs `scripts/process_ahrefs.py` (Storage files -> parse -> Supabase upsert).
+- `process-keyword-gap.yml` runs `scripts/process_keyword_gap.py` (Storage files -> parse -> Supabase upsert).
 - Frontend reads Supabase directly.
 - Refresh buttons dispatch GitHub workflows through a server-side API route in the frontend app.
 
@@ -42,6 +43,8 @@ Local `.env` and/or GitHub Actions secrets:
 - `SUPABASE_SERVICE_KEY`
 - `SUPABASE_DB_URL` (required for migration runner only)
 - `GOOGLE_CREDENTIALS_JSON` (Actions secret) or `GOOGLE_APPLICATION_CREDENTIALS` (local file path)
+- `AHREFS_STORAGE_BUCKET` (optional, default: `ahrefs-exports`)
+- `KEYWORD_GAP_STORAGE_BUCKET` (optional, default: `keyword_gap`)
 - `GSC_PROPERTY_*` for all websites
 - `GA4_PROPERTY_*` for all websites
 
@@ -59,6 +62,29 @@ Local `.env` and/or GitHub Actions secrets:
 - Timeout: 60 minutes
 - Writes: `ahrefs_overview`, `ahrefs_referring_domains`, `ahrefs_broken_backlinks`, `ahrefs_competitors`, plus Ahrefs snapshots into `website_keywords` and `website_pages`
 
+### Keyword Gap Processing
+
+- Workflow: `.github/workflows/process-keyword-gap.yml`
+- Timeout: 60 minutes
+- Storage bucket: `keyword_gap`
+- Writes: `content_gap_keywords`
+- Deduplication: upsert conflict key is `(date, website, keyword)` and parser dedupes duplicate keys before insert
+
+### Local Keyword Gap Upload
+
+```bash
+python scripts/upload_keyword_gap.py
+```
+
+Default search order for local files:
+
+1. `KEYWORD_GAP_EXPORT_DIR` (if set)
+2. `../Keyword Gap`
+3. `../keyword gap`
+4. `../Content Gap`
+5. `../content gap`
+6. `../data-consolidation-dashboard/Content Gap`
+
 ## Reliability Controls
 
 - Upserts use supabase-py compatible signatures (no `default_to_null`).
@@ -66,6 +92,7 @@ Local `.env` and/or GitHub Actions secrets:
 - Transient API/network errors use exponential backoff retries.
 - Snapshot date is taken from source filenames and preserved for idempotent reruns.
 - Ingestion run metadata is recorded in `ingestion_runs` when table is present.
+- Keyword gap processing also enforces per-run dedupe on `(date, website, keyword)` before upsert.
 
 ## Security
 

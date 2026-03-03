@@ -23,6 +23,7 @@ GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./google-
 
 # ── Storage bucket ────────────────────────────────────────────
 AHREFS_BUCKET = os.getenv("AHREFS_STORAGE_BUCKET", "ahrefs-exports")
+KEYWORD_GAP_BUCKET = os.getenv("KEYWORD_GAP_STORAGE_BUCKET", "keyword_gap")
 
 # ── Websites ──────────────────────────────────────────────────
 WEBSITES = [

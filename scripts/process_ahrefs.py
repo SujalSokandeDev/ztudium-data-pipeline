@@ -51,6 +51,12 @@ WEBSITE_MAP = {
     "wisdomia": "Wisdomia",
 }
 
+_CANONICAL_NAME_LOOKUP = {v.lower(): v for v in WEBSITE_MAP.values()}
+_NORMALIZED_LOOKUP = {
+    re.sub(r"[^a-z0-9]+", "", k.lower()): v
+    for k, v in {**WEBSITE_MAP, **_CANONICAL_NAME_LOOKUP}.items()
+}
+
 
 def detect_website(filename):
     """Detect website from filename."""
@@ -58,6 +64,21 @@ def detect_website(filename):
     for slug, name in WEBSITE_MAP.items():
         if slug in f:
             return name
+
+    # Ahrefs_Overview_<WebsiteName>_YYYY-MM-DD.txt
+    m = re.search(r"ahrefs_overview_([^_]+)_\d{4}-\d{2}-\d{2}\.txt$", f)
+    if m:
+        key = re.sub(r"[^a-z0-9]+", "", m.group(1))
+        if key in _NORMALIZED_LOOKUP:
+            return _NORMALIZED_LOOKUP[key]
+
+    # Domain-based filenames (e.g. www.businessabc.net-...)
+    m = re.match(r"(?:www\.)?([a-z0-9-]+)\.(?:com|net|org|ai|io)", f)
+    if m:
+        key = re.sub(r"[^a-z0-9]+", "", m.group(1))
+        if key in _NORMALIZED_LOOKUP:
+            return _NORMALIZED_LOOKUP[key]
+
     return None
 
 
@@ -77,6 +98,12 @@ def categorize_file(filename):
     if "orgcompetitors" in f and "map" not in f:
         return "organic_competitors"
     return None
+
+
+def extract_snapshot_date(filename: str) -> str:
+    """Extract YYYY-MM-DD snapshot date from filename."""
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", filename)
+    return m.group(1) if m else date.today().isoformat()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -199,10 +226,15 @@ def _read_ahrefs_csv(filepath):
 
 def parse_overview_txt(filepath, website_name):
     """Parse an overview .txt file. Returns a dict."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            text = f.read()
-    except Exception:
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "utf-16", "latin-1"):
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                text = f.read()
+            break
+        except Exception:
+            continue
+    if text is None:
         return None
 
     def extract(pattern, group=1):
@@ -219,8 +251,7 @@ def parse_overview_txt(filepath, website_name):
         return None, None
 
     # Extract date from filename
-    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(filepath))
-    file_date = date_match.group(1) if date_match else date.today().isoformat()
+    file_date = extract_snapshot_date(os.path.basename(filepath))
 
     dr_val, dr_delta = extract_delta("DR")
     ur_val, ur_delta = extract_delta("UR")
@@ -235,7 +266,10 @@ def parse_overview_txt(filepath, website_name):
         "dr_delta": dr_delta,
         "ur": ur_val,
         "ur_delta": ur_delta,
-        "ahrefs_rank": _parse_number(extract(r"Ahrefs Rank:\s*([\d,.]+)")),
+        "ahrefs_rank": _parse_number(
+            extract(r"Ahrefs Rank:\s*([\d,.]+)") or
+            extract(r"AR:\s*([\d,.]+)")
+        ),
         "backlinks": _parse_number(extract(r"Backlinks:\s*([\d,.KMBkmb]+)")),
         "ref_domains": ref_val,
         "ref_domains_delta": ref_delta,
@@ -249,6 +283,7 @@ def parse_overview_txt(filepath, website_name):
 def parse_organic_keywords(filepath, website):
     """Parse organic keywords CSV. Returns top 200 keywords."""
     rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     keywords = []
     for row in rows[:200]:
         keywords.append({
@@ -258,12 +293,13 @@ def parse_organic_keywords(filepath, website):
             "position": _parse_number(row.get("Position", row.get("Current position", 0))),
             "traffic": _parse_number(row.get("Traffic", row.get("Estimated traffic", 0))),
         })
-    return {"website": website, "total": len(rows), "keywords": keywords}
+    return {"website": website, "date": snapshot_date, "total": len(rows), "keywords": keywords}
 
 
 def parse_referring_domains(filepath, website):
     """Parse referring domains CSV. Returns top 500 domains."""
     rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     domains = []
     for row in rows[:500]:
         domains.append({
@@ -273,12 +309,13 @@ def parse_referring_domains(filepath, website):
             "links_to_target": _parse_number(row.get("Links to target", 0)),
             "first_seen": row.get("First seen", ""),
         })
-    return {"website": website, "total": len(rows), "domains": domains}
+    return {"website": website, "date": snapshot_date, "total": len(rows), "domains": domains}
 
 
 def parse_top_pages(filepath, website):
     """Parse top pages CSV. Returns top 100 pages."""
     rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     pages = []
     for row in rows[:100]:
         pages.append({
@@ -287,12 +324,13 @@ def parse_top_pages(filepath, website):
             "keywords_count": _parse_number(row.get("Keywords", row.get("Number of keywords", 0))),
             "top_keyword": row.get("Top keyword", ""),
         })
-    return {"website": website, "total": len(rows), "pages": pages}
+    return {"website": website, "date": snapshot_date, "total": len(rows), "pages": pages}
 
 
 def parse_broken_backlinks(filepath, website):
     """Parse broken backlinks CSV. Returns top 200 links."""
     rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     links = []
     for row in rows[:200]:
         links.append({
@@ -302,12 +340,13 @@ def parse_broken_backlinks(filepath, website):
             "anchor": row.get("Anchor", row.get("Link anchor", "")),
             "dr": _parse_number(row.get("Domain Rating", row.get("DR", 0))),
         })
-    return {"website": website, "total": len(rows), "links": links}
+    return {"website": website, "date": snapshot_date, "total": len(rows), "links": links}
 
 
 def parse_competitors(filepath, website):
     """Parse organic competitors CSV."""
     rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     competitors = []
     for row in rows[:50]:
         competitors.append({
@@ -316,7 +355,7 @@ def parse_competitors(filepath, website):
             "share": row.get("Share", ""),
             "competitor_keywords": _parse_number(row.get("SE keywords", row.get("Keywords", 0))),
         })
-    return {"website": website, "total": len(rows), "competitors": competitors}
+    return {"website": website, "date": snapshot_date, "total": len(rows), "competitors": competitors}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -443,9 +482,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         ok = data.get("organic_keywords")
         if ok:
+            snapshot_date = ok.get("date", today_str)
             for kw in ok.get("keywords", [])[:200]:
                 kw_rows.append({k: v for k, v in {
-                    "date": today_str, "website": ws, "keyword": kw.get("keyword"),
+                    "date": snapshot_date, "website": ws, "keyword": kw.get("keyword"),
                     "clicks": kw.get("traffic") or 0, "impressions": kw.get("volume") or 0,
                     "position": kw.get("position"), "search_volume": kw.get("volume"),
                     "keyword_difficulty": kw.get("kd"), "traffic_estimate": kw.get("traffic"),
@@ -459,9 +499,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         tp = data.get("top_pages")
         if tp:
+            snapshot_date = tp.get("date", today_str)
             for pg in tp.get("pages", [])[:100]:
                 pg_rows.append({k: v for k, v in {
-                    "date": today_str, "website": ws, "url": pg.get("url"),
+                    "date": snapshot_date, "website": ws, "url": pg.get("url"),
                     "clicks": pg.get("traffic") or 0, "traffic_ahrefs": pg.get("traffic"),
                     "keywords_count": pg.get("keywords_count"), "top_keyword": pg.get("top_keyword"),
                     "source": "ahrefs",
@@ -474,9 +515,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         rd = data.get("referring_domains")
         if rd:
+            snapshot_date = rd.get("date", today_str)
             for dom in rd.get("domains", [])[:500]:
                 rd_rows.append({k: v for k, v in {
-                    "date": today_str, "website": ws, "domain": dom.get("domain"),
+                    "date": snapshot_date, "website": ws, "domain": dom.get("domain"),
                     "dr": dom.get("dr"), "dofollow_links": dom.get("dofollow_links"),
                     "links_to_target": dom.get("links_to_target"), "first_seen": dom.get("first_seen"),
                 }.items() if v is not None})
@@ -488,6 +530,7 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         bb = data.get("broken_backlinks")
         if bb:
+            snapshot_date = bb.get("date", today_str)
             for link in bb.get("links", [])[:200]:
                 http_code = None
                 try:
@@ -495,7 +538,7 @@ def upload_parsed_data(parsed_data):
                 except (ValueError, TypeError):
                     pass
                 bb_rows.append({k: v for k, v in {
-                    "date": today_str, "website": ws,
+                    "date": snapshot_date, "website": ws,
                     "referring_page": link.get("referring_url"), "target_url": link.get("target_url"),
                     "http_code": http_code, "anchor_text": link.get("anchor"),
                     "ref_domain_dr": link.get("dr"),
@@ -508,9 +551,10 @@ def upload_parsed_data(parsed_data):
     for ws, data in parsed_data.items():
         comp = data.get("organic_competitors")
         if comp:
+            snapshot_date = comp.get("date", today_str)
             for rank, c_item in enumerate(comp.get("competitors", []), 1):
                 comp_rows.append({k: v for k, v in {
-                    "date": today_str, "website": ws,
+                    "date": snapshot_date, "website": ws,
                     "competitor_domain": c_item.get("domain"),
                     "keyword_overlap": c_item.get("common_keywords"),
                     "share_pct": c_item.get("share"),

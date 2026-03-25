@@ -10,6 +10,8 @@ import os
 import sys
 import json
 import logging
+import time
+import threading
 from datetime import date, timedelta, datetime
 from collections import defaultdict
 
@@ -41,6 +43,61 @@ if not OPENAI_API_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ══════════════════════════════════════════════════════════════
+#  TERMINAL OUTPUT HELPERS
+# ══════════════════════════════════════════════════════════════
+
+class Spinner:
+    """Threaded spinner that shows progress during long-running API calls."""
+    FRAMES = ["   ", ".  ", ".. ", "...", " ..", "  ."]
+
+    def __init__(self, message):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = None
+        self._start_time = None
+
+    def __enter__(self):
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self._stop.set()
+        self._thread.join()
+        elapsed = time.time() - self._start_time
+        print(f"\r  {self.message} done ({elapsed:.1f}s)               ")
+
+    def _spin(self):
+        idx = 0
+        while not self._stop.is_set():
+            elapsed = time.time() - self._start_time
+            frame = self.FRAMES[idx % len(self.FRAMES)]
+            print(f"\r  {self.message}{frame} ({elapsed:.0f}s)", end="", flush=True)
+            idx += 1
+            self._stop.wait(0.4)
+
+
+def print_header(title):
+    """Print a clean section header."""
+    w = 60
+    print()
+    print(f"  {'─' * w}")
+    print(f"  {title}")
+    print(f"  {'─' * w}")
+
+
+def print_box(title, subtitle=""):
+    """Print a prominent title box."""
+    w = 60
+    print(f"\n  {'═' * w}")
+    print(f"   {title}")
+    if subtitle:
+        print(f"   {subtitle}")
+    print(f"  {'═' * w}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -650,19 +707,20 @@ def generate_insights(context):
     logger.info(f"  Sending {len(context_str)} chars of context to GPT-4o-mini")
 
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            max_tokens=3000,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": (
-                    "Analyze this comprehensive SEO dashboard data. The data is organized by priority: "
-                    "anomalies first, then keyword/page changes, then baselines and context.\n\n"
-                    f"{context_str}"
-                )},
-            ],
-        )
+        with Spinner("GPT-4o-mini analyzing insights"):
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.3,
+                max_tokens=3000,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": (
+                        "Analyze this comprehensive SEO dashboard data. The data is organized by priority: "
+                        "anomalies first, then keyword/page changes, then baselines and context.\n\n"
+                        f"{context_str}"
+                    )},
+                ],
+            )
 
         raw = response.choices[0].message.content.strip()
 
@@ -713,158 +771,184 @@ def generate_insights(context):
 
 
 # ══════════════════════════════════════════════════════════════
-#  WEEKLY CONTENT PLAN GENERATION
+#  TOPIC-BASED KEYWORD CLUSTERING (v3)
 # ══════════════════════════════════════════════════════════════
 
-CONTENT_PLAN_PROMPT = """You are a senior content strategist for Ztudium, a media company operating 9 websites:
-CitiesABC, BusinessABC, HedgeThink, FashionABC, TradersDNA, FreedomX, Wisdomia, SportsDNA, IntelligentHQ.
+CLUSTER_PROMPT = """You are an expert SEO content strategist. Analyze the keyword data below and group related keywords into thematic content clusters.
 
-Based on the keyword gap data, traffic trends, competitor data, and AI insights provided, create a 
-WEEKLY CONTENT PLAN with 6-7 specific content pieces per website.
+CRITICAL COVERAGE RULE:
+- You MUST generate clusters for EVERY website provided in the data. Do NOT skip any website.
+- Each website MUST have between 3 and 5 clusters. No less than 3, no more than 5.
+- Each cluster must represent a genuinely DISTINCT topic theme — not variations of the same topic.
+- If a website has fewer qualifying keywords, create clusters with fewer related keywords (minimum 2), but still create 3 clusters.
 
-For each website that has keyword gap data, recommend the most impactful content to create THIS WEEK.
+STRICT RULES:
+1. ONLY use keywords that appear in the provided data — DO NOT invent keywords
+2. Every keyword you include MUST have KD ≤ 5 and Volume ≥ 1000
+3. Each cluster needs 1 primary keyword (highest volume in cluster) + 2-8 related keywords
+4. Keywords in the same cluster MUST be semantically related (same topic/intent family)
+5. Hub article title must be optimized to target the ENTIRE cluster, not just the primary keyword
+6. Never use generic titles like "Ultimate Guide to X" — be specific, compelling, and SEO-optimized
+7. Estimate traffic realistically: assume 15-25% CTR for position 1-3 on total cluster volume
+8. If keywords are available with slightly higher KD (up to 10) or lower volume (down to 500) but are topically perfect, you may include them as related keywords but PREFER KD ≤ 5 / vol ≥ 1000
 
-CRITICAL REQUIREMENTS:
-1. Each suggestion must target a SPECIFIC keyword from the data
-2. Include a concrete ARTICLE TITLE (ready to publish)
-3. Specify the CONTENT FORMAT (guide, listicle, comparison, case study, FAQ, how-to, news analysis)
-4. Explain WHY this content should be prioritized (volume, low KD, competitor gap, trending topic)
-5. Provide ESTIMATED TRAFFIC POTENTIAL based on keyword volume and realistic CTR
-6. If a website is losing traffic on certain topics, recommend defensive content for those topics
-7. Cross-reference with competitor data — mention what competitors are doing
+RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 
-RESPOND WITH VALID JSON ONLY. No markdown, no code fences. Format:
 {
   "week_of": "YYYY-MM-DD",
   "sites": [
     {
       "website": "WebsiteName",
-      "summary": "Brief 1-sentence content strategy direction for this site this week",
-      "briefs": [
+      "summary": "One-sentence content strategy direction for this site",
+      "clusters": [
         {
-          "priority": 1,
-          "keyword": "target keyword from the data",
-          "title": "Ready-to-publish article title",
-          "format": "guide|listicle|comparison|case-study|faq|how-to|news-analysis",
-          "rationale": "Why this content now — cite specific numbers",
-          "estimated_traffic": "Realistic monthly traffic estimate with reasoning",
-          "search_volume": 1000,
-          "kd": 2
+          "cluster_topic": "Descriptive theme name",
+          "hub_article_title": "SEO-optimized article title targeting entire cluster",
+          "primary_keyword": {
+            "keyword": "main keyword from data",
+            "volume": 20000,
+            "kd": 2,
+            "intent": "informational"
+          },
+          "related_keywords": [
+            {"keyword": "related kw from data", "volume": 8000, "kd": 1, "intent": "informational"},
+            {"keyword": "another related kw", "volume": 5000, "kd": 3, "intent": "commercial"}
+          ],
+          "total_cluster_volume": 46000,
+          "estimated_traffic": 9200,
+          "strategy": "Why this cluster matters — cite specific competitor gaps and traffic potential"
         }
       ]
     }
   ]
 }
 
-RULES:
-- Only include websites that have keyword gap data available
-- Maximum 7 briefs per website, minimum 3
-- Order briefs by priority (1 = most important)
-- Article titles should be compelling and SEO-optimized
-- Never use generic titles like 'Ultimate Guide to X' — be specific and unique
-- Estimated traffic should be realistic (not just keyword volume)
-- If data is limited for a site, provide fewer but higher-quality suggestions"""
+QUALITY REQUIREMENTS:
+- Generate 3-5 clusters for EVERY website — never skip a website that has keyword data
+- Each cluster must target a genuinely different topic area (e.g. don't make 3 clusters all about "AI")
+- Strategy should mention which competitors rank for these terms
+- If a site has limited data, use broader themes to still create 3 meaningful clusters"""
 
 
 def generate_content_plan(context):
-    """Generate a weekly content plan using GPT-4o-mini."""
-    # Build content-specific context
-    sections = []
+    """Generate topic-based keyword clusters using GPT-4o-mini."""
 
-    # Easy wins grouped by website
-    easy_wins = context.get("easy_wins", [])
-    if easy_wins:
-        sections.append("=== EASY WIN KEYWORDS BY WEBSITE ===")
-        by_site = defaultdict(list)
-        for ew in easy_wins:
-            by_site[ew.get("website", "unknown")].append(ew)
-        for site, kws in sorted(by_site.items()):
-            sections.append(f"\n--- {site} ---")
-            for kw in kws:
-                sections.append(
-                    f"  '{kw.get('keyword')}' (vol={kw.get('volume')}, KD={kw.get('kd')}, "
-                    f"score={kw.get('opportunity_score')}, intent={kw.get('intent')})"
-                )
-
-    # All content gap keywords (not just easy wins) for more options
+    # ── Step 1: Pull ALL content gap keywords (wider net to cover all 9 sites) ──
     all_kw_data = safe_query(
         "content_gap_keywords",
-        "website, keyword, volume, kd, opportunity_score, intent, cluster",
+        "website, keyword, volume, kd, opportunity_score, intent, cluster, competitors",
         order=("volume", True),
-        limit=200,
-        label="all_content_gap"
+        limit=5000,
+        label="all_content_gap_for_clustering"
     )
-    if all_kw_data:
-        sections.append("\n=== ALL CONTENT GAP KEYWORDS (by volume) ===")
-        by_site = defaultdict(list)
-        for kw in all_kw_data:
-            if kw.get("volume", 0) > 0:
-                by_site[kw.get("website", "unknown")].append(kw)
-        for site, kws in sorted(by_site.items()):
-            sections.append(f"\n--- {site} (top keywords) ---")
-            for kw in kws[:20]:
-                sections.append(
-                    f"  '{kw.get('keyword')}' (vol={kw.get('volume')}, KD={kw.get('kd')}, "
-                    f"intent={kw.get('intent')}, cluster={kw.get('cluster')})"
-                )
 
-    # Keyword movers (what we're losing/gaining)
+    if not all_kw_data:
+        logger.info("  No content_gap_keywords data available, skipping clustering")
+        return None
+
+    # ── Step 2: Pre-filter with relaxed criteria to ensure all sites are covered ──
+    # Primary pool: strict KD ≤ 5, vol ≥ 1000
+    qualifying_strict = [
+        kw for kw in all_kw_data
+        if kw.get("volume", 0) >= 1000 and kw.get("kd", 99) <= 5
+    ]
+    # Extended pool: KD ≤ 10, vol ≥ 500 (used only for sites missing from strict pool)
+    qualifying_extended = [
+        kw for kw in all_kw_data
+        if kw.get("volume", 0) >= 500 and kw.get("kd", 99) <= 10
+    ]
+
+    # Merge: use strict pool, then fill in missing sites from extended pool
+    strict_sites = set(kw.get("website") for kw in qualifying_strict)
+    extended_extra = [kw for kw in qualifying_extended if kw.get("website") not in strict_sites]
+    qualifying = qualifying_strict + extended_extra
+
+    logger.info(
+        f"  Pre-filter: {len(all_kw_data)} total -> "
+        f"{len(qualifying_strict)} strict (KD≤5, vol≥1000) across {len(strict_sites)} sites, "
+        f"{len(extended_extra)} extended for missing sites -> {len(qualifying)} total qualifying"
+    )
+
+    if len(qualifying) < 3:
+        logger.info("  Too few qualifying keywords for clustering, skipping")
+        return None
+
+    # Build lookup for post-validation (includes extended pool for lenient matching)
+    kw_lookup = {}
+    for kw in qualifying_extended:  # Use the wider pool for validation
+        key = kw.get("keyword", "").strip().lower()
+        if key:
+            kw_lookup[key] = {
+                "keyword": kw.get("keyword"),
+                "volume": kw.get("volume"),
+                "kd": kw.get("kd"),
+                "intent": kw.get("intent"),
+                "opportunity_score": kw.get("opportunity_score"),
+            }
+
+    # ── Step 3: Build context for GPT grouped by website ──
+    sections = []
+    by_site = defaultdict(list)
+    for kw in qualifying:
+        by_site[kw.get("website", "unknown")].append(kw)
+
+    for site, kws in sorted(by_site.items()):
+        sections.append(f"\n=== {site} ({len(kws)} qualifying keywords) ===")
+        for kw in kws[:60]:  # Max 60 per site to ensure enough data for 3-5 clusters
+            comp_str = ""
+            comps = kw.get("competitors")
+            if comps and isinstance(comps, list) and len(comps) > 0:
+                top = comps[0] if isinstance(comps[0], dict) else {}
+                comp_str = f", competitor={top.get('domain', top.get('d', ''))}"
+            sections.append(
+                f"  '{kw.get('keyword')}' (vol={kw.get('volume')}, KD={kw.get('kd')}, "
+                f"intent={kw.get('intent')}, score={kw.get('opportunity_score')}{comp_str})"
+            )
+
+    # Add competitor context
+    competitors = context.get("competitors", [])
+    if competitors:
+        sections.append("\n=== COMPETITOR LANDSCAPE ===")
+        comp_by_site = defaultdict(list)
+        for c in competitors:
+            comp_by_site[c["website"]].append(f"{c['competitor_domain']} (overlap={c.get('keyword_overlap')})")
+        for site, comps in comp_by_site.items():
+            sections.append(f"  {site}: {', '.join(comps[:5])}")
+
+    # Add keyword losers for defensive content
     kw_movers = context.get("keyword_movers", {})
     if kw_movers.get("losers"):
-        sections.append("\n=== KEYWORDS LOSING RANKINGS (defend these topics) ===")
-        for m in kw_movers["losers"]:
+        sections.append("\n=== KEYWORDS LOSING RANKINGS (consider defensive clusters) ===")
+        for m in kw_movers["losers"][:15]:
             sections.append(
                 f"  {m['website']}: '{m['keyword']}' dropped #{m['position_was']:.0f} -> "
                 f"#{m['position_now']:.0f}, lost {abs(m['clicks_change'])} clicks"
             )
 
-    # Competitor context
-    competitors = context.get("competitors", [])
-    if competitors:
-        sections.append("\n=== COMPETITORS ===")
-        by_site = defaultdict(list)
-        for c in competitors:
-            by_site[c["website"]].append(f"{c['competitor_domain']} (overlap={c.get('keyword_overlap')})")
-        for site, comps in by_site.items():
-            sections.append(f"  {site}: {', '.join(comps[:5])}")
+    content_context = "\n".join(sections)
+    if len(content_context) > 20000:
+        content_context = content_context[:20000] + "\n[...truncated]"
 
-    # Ahrefs overview for context
-    ahrefs = context.get("ahrefs_overview", [])
-    if ahrefs:
-        sections.append("\n=== SITE AUTHORITY OVERVIEW ===")
-        for a in ahrefs:
-            sections.append(
-                f"  {a.get('website')}: DR={a.get('dr')}, "
-                f"organic_traffic={a.get('organic_traffic')}, "
-                f"keywords={a.get('organic_keywords')}"
+    logger.info(f"  Sending {len(content_context)} chars to GPT for topic clustering")
+
+    # ── Step 4: GPT call ──
+    try:
+        with Spinner("GPT-4o-mini building keyword clusters"):
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.4,
+                max_tokens=12000,
+                messages=[
+                    {"role": "system", "content": CLUSTER_PROMPT},
+                    {"role": "user", "content": (
+                        f"Today's date: {date.today().isoformat()}\n"
+                        f"Create topic-based keyword clusters from this data:\n\n{content_context}"
+                    )},
+                ],
             )
 
-    content_context = "\n".join(sections)
-
-    if len(content_context) > 18000:
-        content_context = content_context[:18000] + "\n[...truncated]"
-
-    if not content_context.strip() or content_context == "":
-        logger.info("  No content gap data available, skipping content plan")
-        return None
-
-    logger.info(f"  Sending {len(content_context)} chars to GPT for content plan")
-
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            max_tokens=4000,
-            messages=[
-                {"role": "system", "content": CONTENT_PLAN_PROMPT},
-                {"role": "user", "content": (
-                    f"Today's date: {date.today().isoformat()}\n"
-                    f"Generate a weekly content plan based on this data:\n\n{content_context}"
-                )},
-            ],
-        )
-
         raw = response.choices[0].message.content.strip()
+        # Clean markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
         if raw.endswith("```"):
@@ -874,16 +958,73 @@ def generate_content_plan(context):
             raw = raw[4:].strip()
 
         plan = json.loads(raw)
-        total_briefs = sum(len(s.get("briefs", [])) for s in plan.get("sites", []))
-        logger.info(f"  Generated content plan: {len(plan.get('sites', []))} sites, {total_briefs} briefs")
-        return plan
 
     except json.JSONDecodeError as e:
-        logger.error(f"  Failed to parse content plan: {e}")
+        logger.error(f"  Failed to parse cluster plan: {e}")
         return None
     except Exception as e:
-        logger.error(f"  Content plan GPT call failed: {e}")
+        logger.error(f"  Cluster GPT call failed: {e}")
         return None
+
+    # ── Step 5: Post-validation — strip hallucinated keywords ──
+    validated_sites = []
+    for site_data in plan.get("sites", []):
+        validated_clusters = []
+        for cluster in site_data.get("clusters", []):
+            # Validate primary keyword
+            pk = cluster.get("primary_keyword", {})
+            pk_key = pk.get("keyword", "").strip().lower()
+            if pk_key in kw_lookup:
+                real = kw_lookup[pk_key]
+                pk["volume"] = real["volume"]
+                pk["kd"] = real["kd"]
+                pk["intent"] = real["intent"]
+            elif pk.get("volume", 0) < 1000 or pk.get("kd", 99) > 5:
+                logger.warning(f"    Skipping cluster '{cluster.get('cluster_topic')}' — primary keyword not in DB")
+                continue
+
+            # Validate related keywords
+            valid_related = []
+            for rk in cluster.get("related_keywords", []):
+                rk_key = rk.get("keyword", "").strip().lower()
+                if rk_key in kw_lookup:
+                    real = kw_lookup[rk_key]
+                    rk["volume"] = real["volume"]
+                    rk["kd"] = real["kd"]
+                    rk["intent"] = real["intent"]
+                    valid_related.append(rk)
+                else:
+                    logger.warning(f"    Stripped hallucinated keyword: '{rk.get('keyword')}'")
+
+            if len(valid_related) < 1:
+                logger.warning(f"    Skipping cluster '{cluster.get('cluster_topic')}' — no valid related keywords")
+                continue
+
+            cluster["related_keywords"] = valid_related
+
+            # Recalculate totals from validated data
+            all_vols = [pk.get("volume", 0)] + [r.get("volume", 0) for r in valid_related]
+            cluster["total_cluster_volume"] = sum(all_vols)
+            cluster["estimated_traffic"] = int(sum(all_vols) * 0.18)  # ~18% CTR estimate
+
+            validated_clusters.append(cluster)
+
+        if validated_clusters:
+            site_data["clusters"] = validated_clusters
+            validated_sites.append(site_data)
+
+    plan["sites"] = validated_sites
+
+    total_clusters = sum(len(s.get("clusters", [])) for s in validated_sites)
+    total_kws = sum(
+        1 + len(c.get("related_keywords", []))
+        for s in validated_sites
+        for c in s.get("clusters", [])
+    )
+    logger.info(f"  Validated: {len(validated_sites)} sites, {total_clusters} clusters, {total_kws} total keywords")
+
+    return plan if validated_sites else None
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -918,57 +1059,98 @@ def store_insights(insights, content_plan=None):
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    logger.info("=" * 60)
-    logger.info("  GENERATING ENHANCED AI STRATEGIC INSIGHTS (v2)")
-    logger.info("=" * 60)
+    start_time = time.time()
 
-    logger.info("  Gathering comprehensive dashboard context...")
+    print_box(
+        "ZTUDIUM AI INSIGHTS ENGINE v3",
+        f"Date: {date.today().isoformat()} | Model: GPT-4o-mini"
+    )
+
+    # ── Phase 1: Data Collection ──
+    print_header("PHASE 1  Collecting Dashboard Data")
     context = gather_context()
 
-    data_summary = {
-        "daily_7d": len(context.get("daily_metrics_7d", [])),
-        "daily_prev_week": len(context.get("daily_metrics_prev_week", [])),
-        "trends_today": len(context.get("trends_today", [])),
-        "anomalies": len(context.get("anomalies_7d", [])),
-        "ahrefs_sites": len(context.get("ahrefs_overview", [])),
-        "keyword_losers": len(context.get("keyword_movers", {}).get("losers", [])),
-        "keyword_gainers": len(context.get("keyword_movers", {}).get("gainers", [])),
-        "page_falling": len(context.get("page_movers", {}).get("falling", [])),
-        "page_rising": len(context.get("page_movers", {}).get("rising", [])),
-        "competitors": len(context.get("competitors", [])),
-        "new_backlinks": len(context.get("new_backlinks", [])),
-        "broken_backlinks": len(context.get("broken_backlinks", [])),
-        "easy_wins": len(context.get("easy_wins", [])),
-        "baselines": len(context.get("baselines", {})),
-    }
-    logger.info(f"  Context collected: {json.dumps(data_summary)}")
+    # Pretty data summary table
+    summary_rows = [
+        ("Daily Metrics (7d)",       len(context.get("daily_metrics_7d", []))),
+        ("Daily Metrics (prev week)",len(context.get("daily_metrics_prev_week", []))),
+        ("Trend Metrics (today)",    len(context.get("trends_today", []))),
+        ("Anomalies Detected",       len(context.get("anomalies_7d", []))),
+        ("Ahrefs Site Profiles",     len(context.get("ahrefs_overview", []))),
+        ("Keyword Gainers",          len(context.get("keyword_movers", {}).get("gainers", []))),
+        ("Keyword Losers",           len(context.get("keyword_movers", {}).get("losers", []))),
+        ("Page Rising",              len(context.get("page_movers", {}).get("rising", []))),
+        ("Page Falling",             len(context.get("page_movers", {}).get("falling", []))),
+        ("Competitors",              len(context.get("competitors", []))),
+        ("New Backlinks (DR 40+)",   len(context.get("new_backlinks", []))),
+        ("Broken Backlinks",         len(context.get("broken_backlinks", []))),
+        ("Easy Win Keywords",        len(context.get("easy_wins", []))),
+        ("Site Baselines",           len(context.get("baselines", {}))),
+    ]
+    total_rows = sum(r[1] for r in summary_rows)
+    print(f"\n  {'Data Source':<30} {'Rows':>6}")
+    print(f"  {'─' * 30} {'─' * 6}")
+    for label, count in summary_rows:
+        marker = " *" if count == 0 else ""
+        print(f"  {label:<30} {count:>6}{marker}")
+    print(f"  {'─' * 30} {'─' * 6}")
+    print(f"  {'Total data points':<30} {total_rows:>6}")
 
-    logger.info("  Calling GPT-4o-mini for enhanced analysis...")
+    # ── Phase 2: Strategic Insights ──
+    print_header("PHASE 2  Generating Strategic Insights")
     insights = generate_insights(context)
 
+    severity_icons = {"high": "!!!", "medium": " ! ", "low": "   "}
+    print(f"\n  {'#':<4} {'Sev':<5} {'Category':<14} Title")
+    print(f"  {'─' * 4} {'─' * 5} {'─' * 14} {'─' * 34}")
     for i, insight in enumerate(insights):
-        severity = insight.get("severity", "?").upper()
-        category = insight.get("category", "?").upper()
+        sev = insight.get("severity", "low")
+        cat = insight.get("category", "?")
         title = insight.get("title", "No title")
-        logger.info(f"  [{i+1}] [{severity}] {category}: {title}")
+        icon = severity_icons.get(sev, "   ")
+        print(f"  {i+1:<4} {icon:<5} {cat:<14} {title[:50]}")
 
-    logger.info("  Generating weekly content plan...")
+    high_count = sum(1 for i in insights if i.get("severity") == "high")
+    med_count = sum(1 for i in insights if i.get("severity") == "medium")
+    print(f"\n  Summary: {len(insights)} insights ({high_count} high, {med_count} medium)")
+
+    # ── Phase 3: Topic-Based Clustering ──
+    print_header("PHASE 3  Building Topic-Based Keyword Clusters")
     content_plan = generate_content_plan(context)
 
     if content_plan:
+        total_clusters = 0
+        total_kws = 0
         for site_plan in content_plan.get("sites", []):
             site_name = site_plan.get("website", "?")
-            briefs = site_plan.get("briefs", [])
-            logger.info(f"  CONTENT PLAN [{site_name}]: {len(briefs)} briefs")
-            for b in briefs:
-                logger.info(f"    #{b.get('priority', '?')}: {b.get('title', 'No title')}")
+            clusters = site_plan.get("clusters", [])
+            total_clusters += len(clusters)
+            print(f"\n  {site_name} ({len(clusters)} clusters)")
+            print(f"  {'─' * 55}")
+            for j, c in enumerate(clusters):
+                pk = c.get("primary_keyword", {})
+                related = c.get("related_keywords", [])
+                total_kws += 1 + len(related)
+                vol_str = f"{c.get('total_cluster_volume', 0):,}"
+                print(f"  {j+1}. {c.get('cluster_topic', '?')}")
+                print(f"     Title: {c.get('hub_article_title', '?')}")
+                print(f"     Primary: '{pk.get('keyword', '?')}' (vol={pk.get('volume', 0):,}, KD={pk.get('kd', '?')})")
+                print(f"     Related: {len(related)} keywords | Cluster vol: {vol_str} | Est. traffic: ~{c.get('estimated_traffic', 0):,}")
+        print(f"\n  Totals: {len(content_plan.get('sites', []))} sites, {total_clusters} clusters, {total_kws} keywords")
+    else:
+        print("\n  No qualifying keywords found (KD <= 5, Vol >= 1000)")
+        print("  Clustering skipped.")
 
-    logger.info("  Storing insights + content plan...")
+    # ── Phase 4: Store Results ──
+    print_header("PHASE 4  Storing Results")
     store_insights(insights, content_plan)
 
-    logger.info("=" * 60)
-    logger.info(f"  DONE — {len(insights)} insights + content plan generated and stored")
-    logger.info("=" * 60)
+    # ── Done ──
+    elapsed = time.time() - start_time
+    print_box(
+        f"COMPLETE  {len(insights)} insights + {'clusters' if content_plan else 'no clusters'} stored",
+        f"Total time: {elapsed:.1f}s | Date: {date.today().isoformat()}"
+    )
 
 
 if __name__ == "__main__":

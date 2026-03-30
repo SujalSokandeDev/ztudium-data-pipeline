@@ -18,6 +18,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Suppress noisy HTTP request logs from httpx / supabase
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("supabase").setLevel(logging.WARNING)
+
 # ── Supabase setup ──────────────────────────────────────────
 try:
     from supabase import create_client

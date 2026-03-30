@@ -1,8 +1,8 @@
 """
-generate_insights.py — Enhanced AI Strategic Insights Engine v2
-Uses GPT-4o-mini to analyze comprehensive dashboard data and generate
-executive-level strategic recommendations with root cause analysis,
-keyword/page-level drill-downs, competitor context, and quantified impacts.
+generate_insights.py — Strategic Insights Engine v4
+Analyzes comprehensive dashboard data and generates executive-level
+strategic recommendations with root cause analysis, keyword/page-level
+drill-downs, competitor context, and quantified impacts.
 
 Run after compute_trends.py: python scripts/generate_insights.py
 """
@@ -20,6 +20,11 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Suppress noisy HTTP request logs from httpx / openai / supabase
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("supabase").setLevel(logging.WARNING)
 
 # ── Dependencies ────────────────────────────────────────────
 try:
@@ -704,12 +709,12 @@ def generate_insights(context):
     if len(context_str) > max_context:
         context_str = context_str[:max_context] + "\n\n[...data truncated for token limits]"
 
-    logger.info(f"  Sending {len(context_str)} chars of context to GPT-4o-mini")
+    logger.info(f"  Sending {len(context_str)} chars of context for analysis")
 
     try:
-        with Spinner("GPT-4o-mini analyzing insights"):
+        with Spinner("Analyzing strategic insights"):
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 temperature=0.3,
                 max_tokens=3000,
                 messages=[
@@ -746,24 +751,24 @@ def generate_insights(context):
         return insights
 
     except json.JSONDecodeError as e:
-        logger.error(f"  Failed to parse GPT response: {e}")
+        logger.error(f"  Failed to parse analysis response: {e}")
         logger.error(f"  Raw response: {raw[:500]}")
         return [{
             "category": "urgent",
             "severity": "low",
             "title": "Insight generation encountered a parsing issue",
-            "analysis": "AI analysis ran but the response format was unexpected. This is typically temporary.",
+            "analysis": "Analysis ran but the response format was unexpected. This is typically temporary.",
             "action": "Re-run the insight generation script. If this persists, check the OPENAI_API_KEY.",
             "impact": "No impact on dashboard functionality.",
             "related_website": "all"
         }]
     except Exception as e:
-        logger.error(f"  GPT API call failed: {e}")
+        logger.error(f"  Insights API call failed: {e}")
         return [{
             "category": "urgent",
             "severity": "low",
-            "title": "AI insights API call failed",
-            "analysis": f"The OpenAI API call returned an error: {str(e)[:200]}",
+            "title": "Insights generation failed",
+            "analysis": f"The analysis API call returned an error: {str(e)[:200]}",
             "action": "Check OPENAI_API_KEY is valid and has credits. Re-run the script.",
             "impact": "No insights generated for today. Previous insights remain visible.",
             "related_website": "all"
@@ -771,26 +776,68 @@ def generate_insights(context):
 
 
 # ══════════════════════════════════════════════════════════════
-#  TOPIC-BASED KEYWORD CLUSTERING (v3)
+#  TOPIC-BASED KEYWORD CLUSTERING (v4)
 # ══════════════════════════════════════════════════════════════
+
+# Stop words / qualifiers to strip when extracting core topic from a longtail
+CORE_TOPIC_STRIP = {
+    "best", "top", "free", "cheap", "how", "to", "what", "is", "are",
+    "why", "does", "can", "do", "the", "a", "an", "for", "in", "of",
+    "vs", "versus", "and", "or", "with", "without", "near", "me",
+    "online", "2024", "2025", "2026", "2027",
+}
+
+# Question prefixes for identifying question-format keywords
+QUESTION_PREFIXES = ("how ", "what ", "why ", "is ", "does ", "can ", "do ", "are ", "which ", "where ", "when ", "should ")
+
+
+def extract_core_topic(longtail_keyword: str) -> str:
+    """Extract the core head term from a longtail keyword by stripping qualifiers."""
+    words = longtail_keyword.lower().strip().split()
+    core = [w for w in words if w not in CORE_TOPIC_STRIP and not w.isdigit()]
+    return " ".join(core) if core else longtail_keyword.lower().strip()
+
+
+def find_question_keyword(keywords: list) -> str | None:
+    """Find the best question-format keyword from a list of keyword dicts."""
+    candidates = []
+    for kw in keywords:
+        kw_str = kw.get("keyword", "").strip().lower()
+        if any(kw_str.startswith(prefix) for prefix in QUESTION_PREFIXES):
+            # Score by volume (prefer high volume question keywords)
+            candidates.append((kw_str, kw.get("volume", 0)))
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+    return None
+
+
+def compute_opportunity_score(volume: int, kd: int) -> float:
+    """Compute opportunity score: high volume + low difficulty = high score."""
+    return round(volume * (1 / (kd + 1)), 1)
+
 
 CLUSTER_PROMPT = """You are an expert SEO content strategist. Analyze the keyword data below and group related keywords into thematic content clusters.
 
 CRITICAL COVERAGE RULE:
 - You MUST generate clusters for EVERY website provided in the data. Do NOT skip any website.
-- Each website MUST have between 3 and 5 clusters. No less than 3, no more than 5.
+- Each website MUST have exactly 3 clusters.
 - Each cluster must represent a genuinely DISTINCT topic theme — not variations of the same topic.
-- If a website has fewer qualifying keywords, create clusters with fewer related keywords (minimum 2), but still create 3 clusters.
+
+KEYWORD VOLUME RULE:
+- Each cluster should have 1 primary keyword (highest volume) + ideally 10 to 20 related keywords
+- IMPORTANT: If a website does not have enough qualifying keywords to fill 10-20, use AS MANY as are available from the data. Do NOT invent keywords.
+- It is acceptable to have clusters with fewer than 10 related keywords if the data is limited.
+- If there are not enough keywords at KD ≤ 5 / Volume ≥ 1000, include keywords with KD up to 10 or Volume down to 500.
+- NEVER fabricate or invent keywords — only use keywords that appear in the provided data.
 
 STRICT RULES:
-1. ONLY use keywords that appear in the provided data — DO NOT invent keywords
-2. Every keyword you include MUST have KD ≤ 5 and Volume ≥ 1000
-3. Each cluster needs 1 primary keyword (highest volume in cluster) + 2-8 related keywords
-4. Keywords in the same cluster MUST be semantically related (same topic/intent family)
-5. Hub article title must be optimized to target the ENTIRE cluster, not just the primary keyword
-6. Never use generic titles like "Ultimate Guide to X" — be specific, compelling, and SEO-optimized
-7. Estimate traffic realistically: assume 15-25% CTR for position 1-3 on total cluster volume
-8. If keywords are available with slightly higher KD (up to 10) or lower volume (down to 500) but are topically perfect, you may include them as related keywords but PREFER KD ≤ 5 / vol ≥ 1000
+1. ONLY use keywords that appear in the provided data — DO NOT invent or fabricate keywords under any circumstances
+2. PREFER keywords with KD ≤ 5 and Volume ≥ 1000, but include KD ≤ 10 and Volume ≥ 500 when needed
+3. If a website only has 15 total keywords, distribute them across 3 clusters (e.g. 5 per cluster) — do not pad with invented keywords
+4. Hub article title must be optimized to target the ENTIRE cluster, not just the primary keyword
+5. Never use generic titles like "Ultimate Guide to X" — be specific, compelling, and SEO-optimized
+6. Estimate traffic realistically: assume 15-25% CTR for position 1-3 on total cluster volume
 
 RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 
@@ -824,14 +871,15 @@ RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 }
 
 QUALITY REQUIREMENTS:
-- Generate 3-5 clusters for EVERY website — never skip a website that has keyword data
-- Each cluster must target a genuinely different topic area (e.g. don't make 3 clusters all about "AI")
-- Strategy should mention which competitors rank for these terms
-- If a site has limited data, use broader themes to still create 3 meaningful clusters"""
+- Generate exactly 3 clusters for EVERY website — never skip a website
+- Aim for 10-20 related keywords per cluster, but accept fewer if the data doesn't support it
+- NEVER invent keywords — if you can't find enough real keywords, use fewer
+- Each cluster must target a genuinely different topic area
+- Strategy should mention which competitors rank for these terms"""
 
 
 def generate_content_plan(context):
-    """Generate topic-based keyword clusters using GPT-4o-mini."""
+    """Generate topic-based keyword clusters for content briefs."""
 
     # ── Step 1: Pull ALL content gap keywords (wider net to cover all 9 sites) ──
     all_kw_data = safe_query(
@@ -846,27 +894,31 @@ def generate_content_plan(context):
         logger.info("  No content_gap_keywords data available, skipping clustering")
         return None
 
-    # ── Step 2: Pre-filter with relaxed criteria to ensure all sites are covered ──
+    # ── Step 2: Pre-filter — two tiers for progressive threshold relaxation ──
     # Primary pool: strict KD ≤ 5, vol ≥ 1000
     qualifying_strict = [
         kw for kw in all_kw_data
         if kw.get("volume", 0) >= 1000 and kw.get("kd", 99) <= 5
     ]
-    # Extended pool: KD ≤ 10, vol ≥ 500 (used only for sites missing from strict pool)
+    strict_keys = set(kw.get("keyword", "").strip().lower() for kw in qualifying_strict)
+
+    # Extended pool: KD ≤ 10, vol ≥ 500 (fills clusters to 10-20 keywords)
     qualifying_extended = [
         kw for kw in all_kw_data
         if kw.get("volume", 0) >= 500 and kw.get("kd", 99) <= 10
     ]
 
-    # Merge: use strict pool, then fill in missing sites from extended pool
+    # Send ALL extended keywords to the model (it needs enough to form 3 × 10-20 clusters)
+    qualifying = qualifying_extended
+
+    # Count sites in each tier
     strict_sites = set(kw.get("website") for kw in qualifying_strict)
-    extended_extra = [kw for kw in qualifying_extended if kw.get("website") not in strict_sites]
-    qualifying = qualifying_strict + extended_extra
+    all_sites = set(kw.get("website") for kw in qualifying)
 
     logger.info(
         f"  Pre-filter: {len(all_kw_data)} total -> "
         f"{len(qualifying_strict)} strict (KD≤5, vol≥1000) across {len(strict_sites)} sites, "
-        f"{len(extended_extra)} extended for missing sites -> {len(qualifying)} total qualifying"
+        f"{len(qualifying)} extended (KD≤10, vol≥500) across {len(all_sites)} sites"
     )
 
     if len(qualifying) < 3:
@@ -894,7 +946,7 @@ def generate_content_plan(context):
 
     for site, kws in sorted(by_site.items()):
         sections.append(f"\n=== {site} ({len(kws)} qualifying keywords) ===")
-        for kw in kws[:60]:  # Max 60 per site to ensure enough data for 3-5 clusters
+        for kw in kws[:100]:  # Max 100 per site to fill 3 clusters × 10-20 keywords
             comp_str = ""
             comps = kw.get("competitors")
             if comps and isinstance(comps, list) and len(comps) > 0:
@@ -926,18 +978,18 @@ def generate_content_plan(context):
             )
 
     content_context = "\n".join(sections)
-    if len(content_context) > 20000:
-        content_context = content_context[:20000] + "\n[...truncated]"
+    if len(content_context) > 30000:
+        content_context = content_context[:30000] + "\n[...truncated]"
 
-    logger.info(f"  Sending {len(content_context)} chars to GPT for topic clustering")
+    logger.info(f"  Sending {len(content_context)} chars for topic clustering")
 
-    # ── Step 4: GPT call ──
+    # ── Step 4: AI clustering call ──
     try:
-        with Spinner("GPT-4o-mini building keyword clusters"):
+        with Spinner("Building keyword clusters"):
             response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 temperature=0.4,
-                max_tokens=12000,
+                max_tokens=16000,
                 messages=[
                     {"role": "system", "content": CLUSTER_PROMPT},
                     {"role": "user", "content": (
@@ -963,10 +1015,10 @@ def generate_content_plan(context):
         logger.error(f"  Failed to parse cluster plan: {e}")
         return None
     except Exception as e:
-        logger.error(f"  Cluster GPT call failed: {e}")
+        logger.error(f"  Clustering call failed: {e}")
         return None
 
-    # ── Step 5: Post-validation — strip hallucinated keywords ──
+    # ── Step 5: Post-validation — strip hallucinated keywords, enrich with metadata ──
     validated_sites = []
     for site_data in plan.get("sites", []):
         validated_clusters = []
@@ -979,9 +1031,14 @@ def generate_content_plan(context):
                 pk["volume"] = real["volume"]
                 pk["kd"] = real["kd"]
                 pk["intent"] = real["intent"]
-            elif pk.get("volume", 0) < 1000 or pk.get("kd", 99) > 5:
+                pk["relaxed"] = pk_key not in strict_keys
+                pk["opportunity_score"] = compute_opportunity_score(real["volume"], real["kd"])
+            elif pk.get("volume", 0) < 500 or pk.get("kd", 99) > 10:
                 logger.warning(f"    Skipping cluster '{cluster.get('cluster_topic')}' — primary keyword not in DB")
                 continue
+            else:
+                pk["relaxed"] = True
+                pk["opportunity_score"] = compute_opportunity_score(pk.get("volume", 0), pk.get("kd", 0))
 
             # Validate related keywords
             valid_related = []
@@ -992,6 +1049,8 @@ def generate_content_plan(context):
                     rk["volume"] = real["volume"]
                     rk["kd"] = real["kd"]
                     rk["intent"] = real["intent"]
+                    rk["relaxed"] = rk_key not in strict_keys
+                    rk["opportunity_score"] = compute_opportunity_score(real["volume"], real["kd"])
                     valid_related.append(rk)
                 else:
                     logger.warning(f"    Stripped hallucinated keyword: '{rk.get('keyword')}'")
@@ -1000,12 +1059,28 @@ def generate_content_plan(context):
                 logger.warning(f"    Skipping cluster '{cluster.get('cluster_topic')}' — no valid related keywords")
                 continue
 
+            # Sort related keywords by opportunity score (best first)
+            valid_related.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
             cluster["related_keywords"] = valid_related
+
+            # Extract core topic from primary keyword
+            cluster["core_topic"] = extract_core_topic(pk.get("keyword", ""))
+
+            # Find question-format keyword in the cluster
+            all_cluster_kws = [pk] + valid_related
+            q_kw = find_question_keyword(all_cluster_kws)
+            if q_kw:
+                cluster["question_keyword"] = q_kw
 
             # Recalculate totals from validated data
             all_vols = [pk.get("volume", 0)] + [r.get("volume", 0) for r in valid_related]
             cluster["total_cluster_volume"] = sum(all_vols)
-            cluster["estimated_traffic"] = int(sum(all_vols) * 0.18)  # ~18% CTR estimate
+            cluster["estimated_traffic"] = int(sum(all_vols) * 0.18)
+
+            # Count relaxed keywords
+            relaxed_count = sum(1 for kw in all_cluster_kws if kw.get("relaxed"))
+            if relaxed_count > 0:
+                cluster["relaxed_count"] = relaxed_count
 
             validated_clusters.append(cluster)
 
@@ -1021,7 +1096,12 @@ def generate_content_plan(context):
         for s in validated_sites
         for c in s.get("clusters", [])
     )
-    logger.info(f"  Validated: {len(validated_sites)} sites, {total_clusters} clusters, {total_kws} total keywords")
+    total_relaxed = sum(
+        c.get("relaxed_count", 0)
+        for s in validated_sites
+        for c in s.get("clusters", [])
+    )
+    logger.info(f"  Validated: {len(validated_sites)} sites, {total_clusters} clusters, {total_kws} keywords ({total_relaxed} under relaxed thresholds)")
 
     return plan if validated_sites else None
 
@@ -1038,7 +1118,7 @@ def store_insights(insights, content_plan=None):
     row = {
         "date": today_str,
         "insights": json.dumps(insights),
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=__import__('datetime').timezone.utc).isoformat(),
         "dismissed_by_user": False,
     }
 
@@ -1062,8 +1142,8 @@ def main():
     start_time = time.time()
 
     print_box(
-        "ZTUDIUM AI INSIGHTS ENGINE v3",
-        f"Date: {date.today().isoformat()} | Model: GPT-4o-mini"
+        "ZTUDIUM INSIGHTS ENGINE v4",
+        f"Date: {date.today().isoformat()}"
     )
 
     # ── Phase 1: Data Collection ──
@@ -1134,8 +1214,17 @@ def main():
                 vol_str = f"{c.get('total_cluster_volume', 0):,}"
                 print(f"  {j+1}. {c.get('cluster_topic', '?')}")
                 print(f"     Title: {c.get('hub_article_title', '?')}")
+                core = c.get('core_topic', '')
+                q_kw = c.get('question_keyword', '')
+                relaxed_n = c.get('relaxed_count', 0)
                 print(f"     Primary: '{pk.get('keyword', '?')}' (vol={pk.get('volume', 0):,}, KD={pk.get('kd', '?')})")
+                if core:
+                    print(f"     Core topic: '{core}'")
+                if q_kw:
+                    print(f"     Question KW: '{q_kw}'")
                 print(f"     Related: {len(related)} keywords | Cluster vol: {vol_str} | Est. traffic: ~{c.get('estimated_traffic', 0):,}")
+                if relaxed_n:
+                    print(f"     Relaxed threshold: {relaxed_n} keywords included under soft criteria")
         print(f"\n  Totals: {len(content_plan.get('sites', []))} sites, {total_clusters} clusters, {total_kws} keywords")
     else:
         print("\n  No qualifying keywords found (KD <= 5, Vol >= 1000)")

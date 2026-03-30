@@ -26,7 +26,8 @@ import logging
 import argparse
 import tempfile
 import requests
-from datetime import date
+from datetime import date, datetime
+from urllib.parse import urlparse
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -88,6 +89,10 @@ def categorize_file(filename):
     f = filename.lower()
     if f.startswith("ahrefs_overview") and f.endswith(".txt"):
         return "overview"
+    if "internal-links" in f:
+        return "internal_links"
+    if "backlinks" in f and "broken-backlinks" not in f:
+        return "backlinks"
     if "broken-backlinks" in f:
         return "broken_backlinks"
     if "refdomains" in f:
@@ -265,6 +270,60 @@ def _read_ahrefs_csv(filepath):
     return []
 
 
+def _parse_date_text(value):
+    """Parse Ahrefs date/datetime text into YYYY-MM-DD."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("/", "-")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    if re.match(r"^\d{4}-\d{2}-\d{2}", raw):
+        return raw[:10]
+    return None
+
+
+def _normalize_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    scheme = parsed.scheme.lower() if parsed.scheme else "https"
+    host = parsed.netloc.lower().replace("www.", "")
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return f"{scheme}://{host}{path}"
+
+
+def _url_path_tokens(url: str) -> set[str]:
+    path = urlparse(url).path.lower()
+    parts = [part for part in re.split(r"[/\-_]+", path) if part]
+    stop = {"page", "pages", "blog", "wiki", "news", "article", "category", "tag"}
+    return {part for part in parts if len(part) > 2 and part not in stop}
+
+
+def _text_tokens(text: str) -> set[str]:
+    raw = (text or "").lower()
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "into", "your",
+        "what", "when", "where", "which", "about", "their", "have", "will",
+        "after", "before", "over", "under", "than", "then", "them", "they",
+    }
+    return {
+        token for token in re.split(r"[^a-z0-9]+", raw)
+        if len(token) > 2 and token not in stop
+    }
+
+
+def _first_path_segment(url: str) -> str:
+    parts = [part for part in urlparse(url).path.lower().split("/") if part]
+    return parts[0] if parts else ""
+
+
 def parse_overview_txt(filepath, website_name):
     """Parse an overview .txt file. Returns a dict."""
     text = None
@@ -323,17 +382,18 @@ def parse_overview_txt(filepath, website_name):
 
 
 def parse_organic_keywords(filepath, website):
-    """Parse organic keywords CSV. Returns top 200 keywords."""
+    """Parse organic keywords CSV."""
     rows = _read_ahrefs_csv(filepath)
     snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     keywords = []
-    for row in rows[:200]:
+    for row in rows:
         keywords.append({
             "keyword": row.get("Keyword", row.get("keyword", "")),
             "volume": _parse_number(row.get("Volume", row.get("Search volume", 0))),
             "kd": _parse_number(row.get("KD", row.get("Keyword Difficulty", 0))),
             "position": _parse_number(row.get("Position", row.get("Current position", 0))),
-            "traffic": _parse_number(row.get("Traffic", row.get("Estimated traffic", 0))),
+            "traffic": _parse_number(row.get("Organic traffic", row.get("Traffic", row.get("Estimated traffic", 0)))),
+            "url": row.get("Current URL", row.get("URL", "")),
         })
     return {
         "website": website,
@@ -345,11 +405,11 @@ def parse_organic_keywords(filepath, website):
 
 
 def parse_referring_domains(filepath, website):
-    """Parse referring domains CSV. Returns top 500 domains."""
+    """Parse referring domains CSV."""
     rows = _read_ahrefs_csv(filepath)
     snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     domains = []
-    for row in rows[:500]:
+    for row in rows:
         domains.append({
             "domain": row.get("Referring domain", row.get("Domain", "")),
             "dr": _parse_number(row.get("Domain Rating", row.get("DR", 0))),
@@ -367,16 +427,18 @@ def parse_referring_domains(filepath, website):
 
 
 def parse_top_pages(filepath, website):
-    """Parse top pages CSV. Returns top 100 pages."""
+    """Parse top pages CSV."""
     rows = _read_ahrefs_csv(filepath)
     snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     pages = []
-    for row in rows[:100]:
+    for row in rows:
         pages.append({
             "url": row.get("URL", row.get("Page", "")),
-            "traffic": _parse_number(row.get("Traffic", row.get("Organic traffic", 0))),
-            "keywords_count": _parse_number(row.get("Keywords", row.get("Number of keywords", 0))),
-            "top_keyword": row.get("Top keyword", ""),
+            "traffic": _parse_number(row.get("Current traffic", row.get("Traffic", row.get("Organic traffic", 0)))),
+            "keywords_count": _parse_number(row.get("Current # of keywords", row.get("Keywords", row.get("Number of keywords", 0)))),
+            "top_keyword": row.get("Current top keyword", row.get("Top keyword", "")),
+            "ur": _parse_number(row.get("UR", 0)),
+            "referring_domains": _parse_number(row.get("Current referring domains", 0)),
         })
     return {
         "website": website,
@@ -388,15 +450,15 @@ def parse_top_pages(filepath, website):
 
 
 def parse_broken_backlinks(filepath, website):
-    """Parse broken backlinks CSV. Returns top 200 links."""
+    """Parse broken backlinks CSV."""
     rows = _read_ahrefs_csv(filepath)
     snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     links = []
-    for row in rows[:200]:
+    for row in rows:
         links.append({
             "referring_url": row.get("Referring page URL", row.get("Source URL", "")),
             "target_url": row.get("URL (target link)", row.get("Target URL", "")),
-            "http_code": _parse_number(row.get("HTTP code", row.get("Response code", 0))),
+            "http_code": _parse_number(row.get("Target page HTTP code", row.get("HTTP code", row.get("Response code", 0)))),
             "anchor": row.get("Anchor", row.get("Link anchor", "")),
             "dr": _parse_number(row.get("Domain Rating", row.get("DR", 0))),
         })
@@ -414,7 +476,7 @@ def parse_competitors(filepath, website):
     rows = _read_ahrefs_csv(filepath)
     snapshot_date = extract_snapshot_date(os.path.basename(filepath))
     competitors = []
-    for row in rows[:50]:
+    for row in rows:
         competitors.append({
             "domain": row.get("Competitor", row.get("Domain", "")),
             "common_keywords": _parse_number(row.get("Common keywords", 0)),
@@ -428,6 +490,215 @@ def parse_competitors(filepath, website):
         "total": len(rows),
         "competitors": competitors,
     }
+
+
+def parse_backlinks(filepath, website):
+    """Parse backlinks CSV and keep only rows with a lost date."""
+    rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
+    lost_links = []
+    for row in rows:
+        lost_date = _parse_date_text(row.get("Lost"))
+        if not lost_date:
+            continue
+        target_url = row.get("Target URL", row.get("URL (target link)", ""))
+        referring_page_url = row.get("Referring page URL", "")
+        if not target_url or not referring_page_url:
+            continue
+        lost_links.append({
+            "website": website,
+            "referring_page_url": referring_page_url,
+            "domain_rating": _parse_number(row.get("Domain rating", row.get("Domain Rating", row.get("DR", 0)))),
+            "target_url": target_url,
+            "anchor": row.get("Anchor", ""),
+            "first_seen": _parse_date_text(row.get("First seen")),
+            "last_seen": _parse_date_text(row.get("Last seen")),
+            "lost_date": lost_date,
+            "drop_reason": row.get("Drop reason", "") or None,
+        })
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "lost_links": lost_links,
+    }
+
+
+def parse_internal_links(filepath, website):
+    """Parse grouped-similar internal links CSV."""
+    rows = _read_ahrefs_csv(filepath)
+    snapshot_date = extract_snapshot_date(os.path.basename(filepath))
+    internal_links = []
+    for row in rows:
+        source_url = row.get("Referring page URL", "")
+        target_url = row.get("Target URL", "")
+        if not source_url or not target_url:
+            continue
+        internal_links.append({
+            "source_page": source_url,
+            "target_url": target_url,
+            "anchor": row.get("Anchor", ""),
+            "page_traffic": _parse_number(row.get("Page traffic", 0)),
+            "first_seen": _parse_date_text(row.get("First seen")),
+            "last_seen": _parse_date_text(row.get("Last seen")),
+        })
+    return {
+        "website": website,
+        "date": snapshot_date,
+        "source_file": os.path.basename(filepath),
+        "total": len(rows),
+        "internal_links": internal_links,
+    }
+
+
+def _select_target_candidates(organic_keywords: dict) -> list[dict]:
+    """Select one best target keyword per target URL."""
+    best_by_url = {}
+    for row in organic_keywords.get("keywords", []):
+        url = _normalize_url(row.get("url", ""))
+        position = row.get("position")
+        volume = row.get("volume")
+        keyword = (row.get("keyword") or "").strip()
+        if not url or not keyword or position is None or volume is None:
+            continue
+        if position < 4 or position > 10 or volume < 1000:
+            continue
+
+        current = best_by_url.get(url)
+        candidate = {
+            "target_page": url,
+            "target_page_keyword": keyword,
+            "target_page_position": int(position),
+            "target_page_volume": int(volume),
+        }
+        if current is None:
+            best_by_url[url] = candidate
+            continue
+        if candidate["target_page_volume"] > current["target_page_volume"]:
+            best_by_url[url] = candidate
+        elif candidate["target_page_volume"] == current["target_page_volume"] and candidate["target_page_position"] < current["target_page_position"]:
+            best_by_url[url] = candidate
+    return list(best_by_url.values())
+
+
+def _select_source_candidates(top_pages: dict, min_traffic: int = 500) -> list[dict]:
+    """Select donor pages by traffic threshold with a fallback for lower-traffic sites."""
+    all_pages = []
+    seen = set()
+    for row in top_pages.get("pages", []):
+        url = _normalize_url(row.get("url", ""))
+        traffic = row.get("traffic") or 0
+        if not url or url in seen or traffic <= 0:
+            continue
+        seen.add(url)
+        all_pages.append({
+            "source_page": url,
+            "source_page_traffic": int(traffic),
+            "source_top_keyword": (row.get("top_keyword") or "").strip(),
+        })
+
+    all_pages.sort(key=lambda row: row["source_page_traffic"], reverse=True)
+
+    strong_donors = [row for row in all_pages if row["source_page_traffic"] >= min_traffic]
+    if len(strong_donors) >= 5:
+        return strong_donors[:25]
+
+    medium_donors = [row for row in all_pages if row["source_page_traffic"] >= 100]
+    if medium_donors:
+        return medium_donors[:25]
+
+    return all_pages[:10]
+
+
+def _topic_related(source_page: str, target_page: str, target_keyword: str, source_top_keyword: str) -> bool:
+    source_tokens = _url_path_tokens(source_page)
+    target_tokens = _url_path_tokens(target_page)
+    target_keyword_tokens = _text_tokens(target_keyword)
+    source_keyword_tokens = _text_tokens(source_top_keyword)
+
+    if source_tokens & target_tokens:
+        return True
+    if source_tokens & target_keyword_tokens:
+        return True
+    if source_keyword_tokens & target_keyword_tokens:
+        return True
+    if source_keyword_tokens & target_tokens:
+        return True
+
+    source_segment = _first_path_segment(source_page)
+    target_segment = _first_path_segment(target_page)
+    if source_segment and target_segment and source_segment == target_segment:
+        return True
+    return False
+
+
+def _build_existing_link_pairs(internal_links: dict) -> set[tuple[str, str]]:
+    pairs = set()
+    for row in internal_links.get("internal_links", []):
+        source = _normalize_url(row.get("source_page", ""))
+        target = _normalize_url(row.get("target_url", ""))
+        if source and target:
+            pairs.add((source, target))
+    return pairs
+
+
+def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: int = 30) -> list[dict]:
+    """Build deterministic internal-link suggestions for one website."""
+    organic_keywords = site_data.get("organic_keywords")
+    top_pages = site_data.get("top_pages")
+    internal_links = site_data.get("internal_links")
+    if not organic_keywords or not top_pages or not internal_links:
+        return []
+
+    targets = _select_target_candidates(organic_keywords)
+    donors = _select_source_candidates(top_pages, min_traffic=500)
+    existing_pairs = _build_existing_link_pairs(internal_links)
+
+    suggestions = []
+    seen = set()
+    for target in targets:
+        target_page = target["target_page"]
+        for donor in donors:
+            source_page = donor["source_page"]
+            if source_page == target_page:
+                continue
+            if not _topic_related(
+                source_page,
+                target_page,
+                target["target_page_keyword"],
+                donor.get("source_top_keyword", ""),
+            ):
+                continue
+            if (source_page, target_page) in existing_pairs:
+                continue
+
+            dedupe_key = (site_name, source_page, target_page, target["target_page_keyword"])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            score = int(
+                (donor["source_page_traffic"] / 100)
+                + (100 - target["target_page_position"])
+                + (target["target_page_volume"] / 1000)
+            )
+            suggestions.append({
+                "website": site_name,
+                "source_page": source_page,
+                "source_page_traffic": donor["source_page_traffic"],
+                "target_page": target_page,
+                "target_page_keyword": target["target_page_keyword"],
+                "target_page_position": target["target_page_position"],
+                "target_page_volume": target["target_page_volume"],
+                "suggested_anchor": target["target_page_keyword"],
+                "existing_link": False,
+                "score": score,
+                "status": "pending",
+            })
+
+    suggestions.sort(key=lambda row: (row["score"], row["source_page_traffic"], row["target_page_volume"]), reverse=True)
+    return suggestions[:limit]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -729,6 +1000,44 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     c = batch_upsert(client, "ahrefs_competitors", comp_rows, "date,website,competitor_domain")
     logger.info("  ahrefs_competitors: %d upserted", c)
 
+    # Lost backlinks
+    lost_rows = []
+    for ws, data in parsed_data.items():
+        backlinks = data.get("backlinks")
+        if not backlinks:
+            continue
+        for link in backlinks.get("lost_links", []):
+            lost_rows.append({k: v for k, v in {
+                "website": ws,
+                "referring_page_url": link.get("referring_page_url"),
+                "domain_rating": link.get("domain_rating"),
+                "target_url": link.get("target_url"),
+                "anchor": link.get("anchor"),
+                "first_seen": link.get("first_seen"),
+                "last_seen": link.get("last_seen"),
+                "lost_date": link.get("lost_date"),
+                "drop_reason": link.get("drop_reason"),
+            }.items() if v is not None and v != ""})
+    c = batch_upsert(
+        client,
+        "ahrefs_lost_backlinks",
+        lost_rows,
+        "website,referring_page_url,target_url,lost_date",
+    )
+    logger.info("  ahrefs_lost_backlinks: %d upserted", c)
+
+    # Internal linking suggestions
+    suggestion_rows = []
+    for ws, data in parsed_data.items():
+        suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
+    c = batch_upsert(
+        client,
+        "internal_linking_suggestions",
+        suggestion_rows,
+        "website,source_page,target_page,target_page_keyword",
+    )
+    logger.info("  internal_linking_suggestions: %d upserted", c)
+
 
 # ══════════════════════════════════════════════════════════════
 #  Main
@@ -790,10 +1099,14 @@ def main():
                 parsed_data[website]["referring_domains"] = parse_referring_domains(filepath, website)
             elif category == "top_pages":
                 parsed_data[website]["top_pages"] = parse_top_pages(filepath, website)
+            elif category == "backlinks":
+                parsed_data[website]["backlinks"] = parse_backlinks(filepath, website)
             elif category == "broken_backlinks":
                 parsed_data[website]["broken_backlinks"] = parse_broken_backlinks(filepath, website)
             elif category == "organic_competitors":
                 parsed_data[website]["organic_competitors"] = parse_competitors(filepath, website)
+            elif category == "internal_links":
+                parsed_data[website]["internal_links"] = parse_internal_links(filepath, website)
 
             logger.info("  ✅ %s → %s / %s", filename, website, category)
         except Exception as e:

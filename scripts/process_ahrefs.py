@@ -514,7 +514,7 @@ def parse_backlinks(filepath, website):
             "first_seen": _parse_date_text(row.get("First seen")),
             "last_seen": _parse_date_text(row.get("Last seen")),
             "lost_date": lost_date,
-            "drop_reason": row.get("Drop reason", "") or None,
+            "drop_reason": (row.get("Lost status", "") or "").strip(),
         })
     return {
         "website": website,
@@ -1007,7 +1007,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
         if not backlinks:
             continue
         for link in backlinks.get("lost_links", []):
-            lost_rows.append({k: v for k, v in {
+            lost_row = {
                 "website": ws,
                 "referring_page_url": link.get("referring_page_url"),
                 "domain_rating": link.get("domain_rating"),
@@ -1016,8 +1016,12 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 "first_seen": link.get("first_seen"),
                 "last_seen": link.get("last_seen"),
                 "lost_date": link.get("lost_date"),
-                "drop_reason": link.get("drop_reason"),
-            }.items() if v is not None and v != ""})
+                "drop_reason": link.get("drop_reason", ""),
+            }
+            lost_rows.append({
+                k: v for k, v in lost_row.items()
+                if v is not None and (v != "" or k == "drop_reason")
+            })
     c = batch_upsert(
         client,
         "ahrefs_lost_backlinks",

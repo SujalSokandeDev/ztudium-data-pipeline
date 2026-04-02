@@ -685,6 +685,9 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
             )
             suggestions.append({
                 "website": site_name,
+                "source_website": site_name,
+                "target_website": site_name,
+                "suggestion_scope": "within_site",
                 "source_page": source_page,
                 "source_page_traffic": donor["source_page_traffic"],
                 "target_page": target_page,
@@ -699,6 +702,87 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
 
     suggestions.sort(key=lambda row: (row["score"], row["source_page_traffic"], row["target_page_volume"]), reverse=True)
     return suggestions[:limit]
+
+
+def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source: int = 30) -> list[dict]:
+    """Build deterministic cross-platform link suggestions across the Ztudium ecosystem."""
+    site_inputs = {}
+    for site_name, site_data in parsed_data.items():
+        organic_keywords = site_data.get("organic_keywords")
+        top_pages = site_data.get("top_pages")
+        if not organic_keywords or not top_pages:
+            continue
+        targets = _select_target_candidates(organic_keywords)
+        donors = _select_source_candidates(top_pages, min_traffic=500)
+        if not targets or not donors:
+            continue
+        site_inputs[site_name] = {
+            "targets": targets,
+            "donors": donors,
+        }
+
+    suggestions = []
+    seen = set()
+    for source_site, source_data in site_inputs.items():
+        source_suggestions = []
+        for target_site, target_data in site_inputs.items():
+            if source_site == target_site:
+                continue
+            for donor in source_data["donors"]:
+                source_page = donor["source_page"]
+                for target in target_data["targets"]:
+                    target_page = target["target_page"]
+                    if source_page == target_page:
+                        continue
+                    if not _topic_related(
+                        source_page,
+                        target_page,
+                        target["target_page_keyword"],
+                        donor.get("source_top_keyword", ""),
+                    ):
+                        continue
+
+                    dedupe_key = (
+                        "cross_platform",
+                        source_site,
+                        source_page,
+                        target_site,
+                        target_page,
+                        target["target_page_keyword"],
+                    )
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+
+                    score = int(
+                        (donor["source_page_traffic"] / 100)
+                        + (100 - target["target_page_position"])
+                        + (target["target_page_volume"] / 1000)
+                    )
+                    source_suggestions.append({
+                        "website": source_site,
+                        "source_website": source_site,
+                        "target_website": target_site,
+                        "suggestion_scope": "cross_platform",
+                        "source_page": source_page,
+                        "source_page_traffic": donor["source_page_traffic"],
+                        "target_page": target_page,
+                        "target_page_keyword": target["target_page_keyword"],
+                        "target_page_position": target["target_page_position"],
+                        "target_page_volume": target["target_page_volume"],
+                        "suggested_anchor": target["target_page_keyword"],
+                        "existing_link": False,
+                        "score": score,
+                        "status": "pending",
+                    })
+
+        source_suggestions.sort(
+            key=lambda row: (row["score"], row["source_page_traffic"], row["target_page_volume"]),
+            reverse=True,
+        )
+        suggestions.extend(source_suggestions[:limit_per_source])
+
+    return suggestions
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1034,11 +1118,12 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     suggestion_rows = []
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
+    suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
     c = batch_upsert(
         client,
         "internal_linking_suggestions",
         suggestion_rows,
-        "website,source_page,target_page,target_page_keyword",
+        "suggestion_scope,source_website,source_page,target_website,target_page,target_page_keyword",
     )
     logger.info("  internal_linking_suggestions: %d upserted", c)
 

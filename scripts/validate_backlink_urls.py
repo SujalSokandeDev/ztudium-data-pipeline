@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 from urllib.parse import urlparse
 
@@ -242,6 +242,54 @@ def fetch_all_rows(client, table: str, page_size: int = 1000) -> list[dict]:
     return rows
 
 
+def fetch_rows_by_status(client, table: str, status: str, page_size: int = 1000) -> list[dict]:
+    rows = []
+    start = 0
+    while True:
+        response = (
+            client.table(table)
+            .select("*")
+            .eq("validation_status", status)
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        chunk = response.data or []
+        rows.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        start += page_size
+    return rows
+
+
+def fetch_rows_for_validation(client, table: str, recheck_resolved_after_hours: int, page_size: int = 1000) -> list[dict]:
+    pending = fetch_rows_by_status(client, table, "pending", page_size=page_size)
+    needs_review = fetch_rows_by_status(client, table, "needs_review", page_size=page_size)
+    confirmed_broken = fetch_rows_by_status(client, table, "confirmed_broken", page_size=page_size)
+    resolved = fetch_rows_by_status(client, table, "resolved", page_size=page_size)
+
+    if recheck_resolved_after_hours > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=recheck_resolved_after_hours)
+        resolved = [
+            row for row in resolved
+            if (parsed := parse_iso_datetime(row.get("last_validated_at"))) is None
+            or parsed <= cutoff
+        ]
+    else:
+        resolved = []
+
+    return pending + needs_review + confirmed_broken + resolved
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def chunked(items: list[dict], size: int) -> Iterable[list[dict]]:
     for index in range(0, len(items), size):
         yield items[index:index + size]
@@ -304,13 +352,21 @@ def validate_lost_backlink_row(row: dict) -> tuple[str, str]:
     return "needs_review", "; ".join(notes)
 
 
-def run_validation(batch_size: int, batch_delay: float):
+def run_validation(batch_size: int, batch_delay: float, recheck_resolved_after_hours: int):
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    broken_rows = fetch_all_rows(client, "ahrefs_broken_backlinks")
-    lost_rows = fetch_all_rows(client, "ahrefs_lost_backlinks")
+    broken_rows = fetch_rows_for_validation(
+        client,
+        "ahrefs_broken_backlinks",
+        recheck_resolved_after_hours=recheck_resolved_after_hours,
+    )
+    lost_rows = fetch_rows_for_validation(
+        client,
+        "ahrefs_lost_backlinks",
+        recheck_resolved_after_hours=recheck_resolved_after_hours,
+    )
     all_items = [("ahrefs_broken_backlinks", row) for row in broken_rows] + [
         ("ahrefs_lost_backlinks", row) for row in lost_rows
     ]
@@ -323,11 +379,12 @@ def run_validation(batch_size: int, batch_delay: float):
     }
 
     logger.info(
-        "Validating %d backlink rows (%d broken + %d lost) in batches of %d",
+        "Validating %d backlink rows (%d broken + %d lost) in batches of %d (resolved recheck window: %dh)",
         len(all_items),
         len(broken_rows),
         len(lost_rows),
         batch_size,
+        recheck_resolved_after_hours,
     )
 
     for batch_number, batch in enumerate(chunked(all_items, batch_size), start=1):
@@ -369,8 +426,13 @@ def main():
     parser = argparse.ArgumentParser(description="Validate backlink URLs and mark resolved rows")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--batch-delay", type=float, default=2.0)
+    parser.add_argument("--recheck-resolved-after-hours", type=int, default=168)
     args = parser.parse_args()
-    run_validation(batch_size=args.batch_size, batch_delay=args.batch_delay)
+    run_validation(
+        batch_size=args.batch_size,
+        batch_delay=args.batch_delay,
+        recheck_resolved_after_hours=args.recheck_resolved_after_hours,
+    )
 
 
 if __name__ == "__main__":

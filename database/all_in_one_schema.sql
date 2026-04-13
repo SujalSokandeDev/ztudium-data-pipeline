@@ -168,6 +168,8 @@ CREATE TABLE IF NOT EXISTS ahrefs_broken_backlinks (
     referring_page TEXT NOT NULL,
     target_url TEXT,
     http_code INTEGER,
+    target_http_code INTEGER,
+    referring_page_http_code INTEGER,
     anchor_text TEXT,
     ref_domain_dr NUMERIC(8, 2),
     source_file TEXT,

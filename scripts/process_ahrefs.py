@@ -459,6 +459,8 @@ def parse_broken_backlinks(filepath, website):
             "referring_url": row.get("Referring page URL", row.get("Source URL", "")),
             "target_url": row.get("URL (target link)", row.get("Target URL", "")),
             "http_code": _parse_number(row.get("Target page HTTP code", row.get("HTTP code", row.get("Response code", 0)))),
+            "target_http_code": _parse_number(row.get("Target page HTTP code", row.get("HTTP code", row.get("Response code", 0)))),
+            "referring_page_http_code": _parse_number(row.get("Referring page HTTP code", 0)),
             "anchor": row.get("Anchor", row.get("Link anchor", "")),
             "dr": _parse_number(row.get("Domain Rating", row.get("DR", 0))),
         })
@@ -861,6 +863,41 @@ def _upsert_chunk(client, table: str, chunk: list, conflict_cols: str):
     client.table(table).upsert(chunk, on_conflict=conflict_cols).execute()
 
 
+def delete_where(client, table: str, filters: dict, chunk_size: int = 1000) -> int:
+    """Delete rows matching filters. Returns deleted row count on best effort."""
+    if not filters:
+        return 0
+    deleted = 0
+    while True:
+        query = client.table(table).select("id")
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        response = query.limit(chunk_size).execute()
+        rows = response.data or []
+        if not rows:
+            break
+        ids = [row["id"] for row in rows if row.get("id")]
+        if not ids:
+            break
+        client.table(table).delete().in_("id", ids).execute()
+        deleted += len(ids)
+        if len(ids) < chunk_size:
+            break
+    return deleted
+
+
+def replace_snapshot_rows(client, table: str, scopes: list[dict], label: str) -> int:
+    """Delete existing rows for the current snapshot scopes so latest exports fully replace them."""
+    deleted = 0
+    for scope in scopes:
+        if not scope:
+            continue
+        deleted += delete_where(client, table, scope)
+    if deleted:
+        logger.info("  %s: removed %d stale rows before insert", label, deleted)
+    return deleted
+
+
 def _start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
     """Create a run record; best effort only."""
     from supabase import create_client
@@ -939,15 +976,19 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     overview_has_source_file = _supports_column(client, "ahrefs_overview", "source_file")
     ref_domains_has_source_file = _supports_column(client, "ahrefs_referring_domains", "source_file")
     broken_backlinks_has_source_file = _supports_column(client, "ahrefs_broken_backlinks", "source_file")
+    broken_backlinks_has_target_http_code = _supports_column(client, "ahrefs_broken_backlinks", "target_http_code")
+    broken_backlinks_has_referring_page_http_code = _supports_column(client, "ahrefs_broken_backlinks", "referring_page_http_code")
     overview_has_ingestion_run_id = _supports_column(client, "ahrefs_overview", "ingestion_run_id")
     keyword_has_ingestion_run_id = _supports_column(client, "website_keywords", "ingestion_run_id")
     pages_has_ingestion_run_id = _supports_column(client, "website_pages", "ingestion_run_id")
     ref_domains_has_ingestion_run_id = _supports_column(client, "ahrefs_referring_domains", "ingestion_run_id")
     broken_backlinks_has_ingestion_run_id = _supports_column(client, "ahrefs_broken_backlinks", "ingestion_run_id")
     competitors_has_ingestion_run_id = _supports_column(client, "ahrefs_competitors", "ingestion_run_id")
+    websites_in_run = sorted(parsed_data.keys())
 
     # Overviews
     ov_rows = []
+    ov_scopes = []
     for ws, data in parsed_data.items():
         ov = data.get("overview")
         if ov:
@@ -955,17 +996,20 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_overview skipped for %s (missing snapshot date)", ws)
                 continue
+            ov_scopes.append({"website": ws, "date": snapshot_date})
             row = {k: v for k, v in ov.items() if v is not None}
             if run_id and overview_has_ingestion_run_id:
                 row["ingestion_run_id"] = run_id
             if not overview_has_source_file:
                 row.pop("source_file", None)
             ov_rows.append(row)
+    replace_snapshot_rows(client, "ahrefs_overview", ov_scopes, "ahrefs_overview")
     c = batch_upsert(client, "ahrefs_overview", ov_rows, "date,website")
     logger.info("  ahrefs_overview: %d upserted", c)
 
     # Keywords
     kw_rows = []
+    kw_scopes = []
     for ws, data in parsed_data.items():
         ok = data.get("organic_keywords")
         if ok:
@@ -973,6 +1017,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_keywords skipped for %s (missing snapshot date)", ws)
                 continue
+            kw_scopes.append({"website": ws, "date": snapshot_date, "source": "ahrefs"})
             for kw in ok.get("keywords", [])[:200]:
                 kw_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws, "keyword": kw.get("keyword"),
@@ -983,11 +1028,13 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 }.items() if v is not None})
                 if run_id and keyword_has_ingestion_run_id:
                     kw_rows[-1]["ingestion_run_id"] = run_id
+    replace_snapshot_rows(client, "website_keywords", kw_scopes, "ahrefs_keywords")
     c = batch_upsert(client, "website_keywords", kw_rows, "date,website,keyword,source")
     logger.info("  ahrefs_keywords: %d upserted", c)
 
     # Top pages
     pg_rows = []
+    pg_scopes = []
     for ws, data in parsed_data.items():
         tp = data.get("top_pages")
         if tp:
@@ -995,6 +1042,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_pages skipped for %s (missing snapshot date)", ws)
                 continue
+            pg_scopes.append({"website": ws, "date": snapshot_date, "source": "ahrefs"})
             for pg in tp.get("pages", [])[:100]:
                 pg_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws, "url": pg.get("url"),
@@ -1004,11 +1052,13 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 }.items() if v is not None})
                 if run_id and pages_has_ingestion_run_id:
                     pg_rows[-1]["ingestion_run_id"] = run_id
+    replace_snapshot_rows(client, "website_pages", pg_scopes, "ahrefs_pages")
     c = batch_upsert(client, "website_pages", pg_rows, "date,website,url,source")
     logger.info("  ahrefs_pages: %d upserted", c)
 
     # Referring domains
     rd_rows = []
+    rd_scopes = []
     for ws, data in parsed_data.items():
         rd = data.get("referring_domains")
         if rd:
@@ -1016,6 +1066,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_referring_domains skipped for %s (missing snapshot date)", ws)
                 continue
+            rd_scopes.append({"website": ws, "date": snapshot_date})
             for dom in rd.get("domains", [])[:500]:
                 rd_row = {k: v for k, v in {
                     "date": snapshot_date, "website": ws, "domain": dom.get("domain"),
@@ -1028,11 +1079,13 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 if run_id and ref_domains_has_ingestion_run_id:
                     rd_row["ingestion_run_id"] = run_id
                 rd_rows.append(rd_row)
+    replace_snapshot_rows(client, "ahrefs_referring_domains", rd_scopes, "ahrefs_referring_domains")
     c = batch_upsert(client, "ahrefs_referring_domains", rd_rows, "date,website,domain")
     logger.info("  ahrefs_referring_domains: %d upserted", c)
 
     # Broken backlinks
     bb_rows = []
+    bb_scopes = []
     for ws, data in parsed_data.items():
         bb = data.get("broken_backlinks")
         if bb:
@@ -1040,6 +1093,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_broken_backlinks skipped for %s (missing snapshot date)", ws)
                 continue
+            bb_scopes.append({"website": ws, "date": snapshot_date})
             for link in bb.get("links", [])[:200]:
                 http_code = None
                 try:
@@ -1050,19 +1104,27 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                     "date": snapshot_date, "website": ws,
                     "referring_page": link.get("referring_url"), "target_url": link.get("target_url"),
                     "http_code": http_code, "anchor_text": link.get("anchor"),
+                    "target_http_code": link.get("target_http_code"),
+                    "referring_page_http_code": link.get("referring_page_http_code"),
                     "ref_domain_dr": link.get("dr"),
                     "source_file": bb.get("source_file"),
                 }.items() if v is not None}
+                if not broken_backlinks_has_target_http_code:
+                    bb_row.pop("target_http_code", None)
+                if not broken_backlinks_has_referring_page_http_code:
+                    bb_row.pop("referring_page_http_code", None)
                 if not broken_backlinks_has_source_file:
                     bb_row.pop("source_file", None)
                 if run_id and broken_backlinks_has_ingestion_run_id:
                     bb_row["ingestion_run_id"] = run_id
                 bb_rows.append(bb_row)
+    replace_snapshot_rows(client, "ahrefs_broken_backlinks", bb_scopes, "ahrefs_broken_backlinks")
     c = batch_upsert(client, "ahrefs_broken_backlinks", bb_rows, "date,website,referring_page")
     logger.info("  ahrefs_broken_backlinks: %d upserted", c)
 
     # Competitors
     comp_rows = []
+    comp_scopes = []
     for ws, data in parsed_data.items():
         comp = data.get("organic_competitors")
         if comp:
@@ -1070,6 +1132,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
             if not snapshot_date:
                 logger.warning("  ahrefs_competitors skipped for %s (missing snapshot date)", ws)
                 continue
+            comp_scopes.append({"website": ws, "date": snapshot_date})
             for rank, c_item in enumerate(comp.get("competitors", []), 1):
                 comp_rows.append({k: v for k, v in {
                     "date": snapshot_date, "website": ws,
@@ -1081,6 +1144,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 }.items() if v is not None})
                 if run_id and competitors_has_ingestion_run_id:
                     comp_rows[-1]["ingestion_run_id"] = run_id
+    replace_snapshot_rows(client, "ahrefs_competitors", comp_scopes, "ahrefs_competitors")
     c = batch_upsert(client, "ahrefs_competitors", comp_rows, "date,website,competitor_domain")
     logger.info("  ahrefs_competitors: %d upserted", c)
 
@@ -1115,6 +1179,10 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     logger.info("  ahrefs_lost_backlinks: %d upserted", c)
 
     # Internal linking suggestions
+    for ws in websites_in_run:
+        deleted = delete_where(client, "internal_linking_suggestions", {"source_website": ws})
+        if deleted:
+            logger.info("  internal_linking_suggestions: removed %d stale rows for %s", deleted, ws)
     suggestion_rows = []
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))

@@ -27,8 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fetch_google")
 
-END_DATE = date.today() - timedelta(days=2)
-START_DATE = END_DATE - timedelta(days=30)
+GSC_END_DATE = date.today() - timedelta(days=2)
+GSC_START_DATE = GSC_END_DATE - timedelta(days=30)
+GA4_END_DATE = date.today() - timedelta(days=1)
+GA4_START_DATE = GA4_END_DATE - timedelta(days=30)
 TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
@@ -223,8 +225,8 @@ def fetch_gsc_daily(name, gsc_prop):
         resp = _execute_gsc_query(
             gsc_prop,
             {
-                "startDate": START_DATE.isoformat(),
-                "endDate": END_DATE.isoformat(),
+                "startDate": GSC_START_DATE.isoformat(),
+                "endDate": GSC_END_DATE.isoformat(),
                 "dimensions": ["date"],
                 "rowLimit": 500,
             },
@@ -261,8 +263,8 @@ def fetch_gsc_keywords(name, gsc_prop):
         resp = _execute_gsc_query(
             gsc_prop,
             {
-                "startDate": START_DATE.isoformat(),
-                "endDate": END_DATE.isoformat(),
+                "startDate": GSC_START_DATE.isoformat(),
+                "endDate": GSC_END_DATE.isoformat(),
                 "dimensions": ["query"],
                 "rowLimit": 100,
             },
@@ -298,8 +300,8 @@ def fetch_gsc_pages(name, gsc_prop):
         resp = _execute_gsc_query(
             gsc_prop,
             {
-                "startDate": START_DATE.isoformat(),
-                "endDate": END_DATE.isoformat(),
+                "startDate": GSC_START_DATE.isoformat(),
+                "endDate": GSC_END_DATE.isoformat(),
                 "dimensions": ["page"],
                 "rowLimit": 100,
             },
@@ -345,7 +347,7 @@ def fetch_ga4_daily(name, ga4_id):
 
         req_all = RunReportRequest(
             property=f"properties/{normalized_id}",
-            date_ranges=[DateRange(start_date=START_DATE.isoformat(), end_date=END_DATE.isoformat())],
+            date_ranges=[DateRange(start_date=GA4_START_DATE.isoformat(), end_date=GA4_END_DATE.isoformat())],
             dimensions=[Dimension(name="date")],
             metrics=[
                 Metric(name="sessions"),
@@ -372,7 +374,7 @@ def fetch_ga4_daily(name, ga4_id):
         from google.analytics.data_v1beta.types import FilterExpression, Filter
         req_organic = RunReportRequest(
             property=f"properties/{normalized_id}",
-            date_ranges=[DateRange(start_date=START_DATE.isoformat(), end_date=END_DATE.isoformat())],
+            date_ranges=[DateRange(start_date=GA4_START_DATE.isoformat(), end_date=GA4_END_DATE.isoformat())],
             dimensions=[Dimension(name="date")],
             metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
             dimension_filter=FilterExpression(
@@ -617,7 +619,8 @@ def main():
     print("=" * 60)
     print("  DAILY GOOGLE FETCH (GSC + GA4)")
     print(f"  Date: {date.today().isoformat()}")
-    print(f"  Range: {START_DATE} to {END_DATE}")
+    print(f"  GSC range: {GSC_START_DATE} to {GSC_END_DATE}")
+    print(f"  GA4 range: {GA4_START_DATE} to {GA4_END_DATE}")
     print("=" * 60)
 
     init_google_apis()

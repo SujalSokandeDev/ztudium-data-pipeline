@@ -33,12 +33,32 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 sys.path.insert(0, os.path.dirname(__file__))
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - available in normal runtime
+    load_dotenv = None
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - available in normal runtime
+    OpenAI = None
+
+if load_dotenv:
+    load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("process_ahrefs")
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+INTERNAL_LINKING_MODEL = os.getenv("INTERNAL_LINKING_MODEL", "gpt-4o")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
 # ── Domain mapping ────────────────────────────────────────────
 WEBSITE_MAP = {
@@ -437,6 +457,9 @@ def parse_top_pages(filepath, website):
             "traffic": _parse_number(row.get("Current traffic", row.get("Traffic", row.get("Organic traffic", 0)))),
             "keywords_count": _parse_number(row.get("Current # of keywords", row.get("Keywords", row.get("Number of keywords", 0)))),
             "top_keyword": row.get("Current top keyword", row.get("Top keyword", "")),
+            "top_keyword_volume": _parse_number(row.get("Current top keyword: Volume", row.get("Top keyword: Volume", 0))),
+            "title": row.get("Title", row.get("Page title", "")),
+            "meta_description": row.get("Meta description", row.get("Description", "")),
             "ur": _parse_number(row.get("UR", 0)),
             "referring_domains": _parse_number(row.get("Current referring domains", 0)),
         })
@@ -613,6 +636,106 @@ def _select_source_candidates(top_pages: dict, min_traffic: int = 500) -> list[d
     return all_pages[:10]
 
 
+def _humanize_token_text(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[-_/]+", " ", text or "")).strip().title()
+
+
+def _infer_page_title(url: str, fallback_keyword: str = "") -> str:
+    if fallback_keyword:
+        return _humanize_token_text(fallback_keyword)
+    parsed = urlparse(url)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if segments:
+        return _humanize_token_text(segments[-1])
+    hostname = parsed.netloc.replace("www.", "")
+    return _humanize_token_text(hostname.split(".")[0])
+
+
+def _build_keyword_map(organic_keywords: dict) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for row in organic_keywords.get("keywords", []):
+        url = _normalize_url(row.get("url", ""))
+        keyword = (row.get("keyword") or "").strip()
+        if not url or not keyword:
+            continue
+        grouped.setdefault(url, []).append({
+            "keyword": keyword,
+            "volume": int(row.get("volume") or 0),
+            "traffic": int(row.get("traffic") or 0),
+        })
+
+    for url, keywords in grouped.items():
+        grouped[url] = sorted(
+            keywords,
+            key=lambda item: (item.get("volume") or 0, item.get("traffic") or 0, item.get("keyword") or ""),
+            reverse=True,
+        )[:3]
+    return grouped
+
+
+def _build_page_enrichment(site_name: str, site_data: dict) -> dict[str, dict]:
+    organic_keywords = site_data.get("organic_keywords") or {}
+    top_pages = site_data.get("top_pages") or {}
+    keywords_by_url = _build_keyword_map(organic_keywords)
+    top_pages_by_url = {
+        _normalize_url(row.get("url", "")): row
+        for row in top_pages.get("pages", [])
+        if _normalize_url(row.get("url", ""))
+    }
+
+    enriched: dict[str, dict] = {}
+    for url in sorted(set(keywords_by_url.keys()) | set(top_pages_by_url.keys())):
+        top_page = top_pages_by_url.get(url, {})
+        top_keywords = keywords_by_url.get(url, [])
+        primary_keyword = (
+            (top_keywords[0]["keyword"] if top_keywords else "")
+            or (top_page.get("top_keyword") or "").strip()
+        )
+        traffic = int(
+            top_page.get("traffic")
+            or (top_keywords[0].get("traffic") if top_keywords else 0)
+            or 0
+        )
+        title = (top_page.get("title") or "").strip() or _infer_page_title(url, primary_keyword)
+        meta_description = (top_page.get("meta_description") or "").strip()
+        section = _first_path_segment(url)
+        keyword_summaries = [
+            {
+                "keyword": item.get("keyword", ""),
+                "volume": int(item.get("volume") or 0),
+            }
+            for item in top_keywords[:3]
+            if item.get("keyword")
+        ]
+        if not keyword_summaries and top_page.get("top_keyword"):
+            keyword_summaries = [{
+                "keyword": top_page.get("top_keyword", ""),
+                "volume": int(top_page.get("top_keyword_volume") or 0),
+            }]
+        topic_tokens = (
+            _url_path_tokens(url)
+            | _text_tokens(title)
+            | _text_tokens(meta_description)
+            | _text_tokens(primary_keyword)
+        )
+        for item in keyword_summaries:
+            topic_tokens |= _text_tokens(item["keyword"])
+
+        enriched[url] = {
+            "website": site_name,
+            "url": url,
+            "title": title,
+            "meta_description": meta_description,
+            "top_keywords": keyword_summaries,
+            "traffic": traffic,
+            "section": section,
+            "topic_tokens": topic_tokens,
+            "primary_keyword": primary_keyword,
+        }
+
+    return enriched
+
+
 def _topic_related(source_page: str, target_page: str, target_keyword: str, source_top_keyword: str) -> bool:
     source_tokens = _url_path_tokens(source_page)
     target_tokens = _url_path_tokens(target_page)
@@ -645,18 +768,177 @@ def _build_existing_link_pairs(internal_links: dict) -> set[tuple[str, str]]:
     return pairs
 
 
-def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: int = 30) -> list[dict]:
-    """Build deterministic internal-link suggestions for one website."""
-    organic_keywords = site_data.get("organic_keywords")
-    top_pages = site_data.get("top_pages")
-    internal_links = site_data.get("internal_links")
-    if not organic_keywords or not top_pages or not internal_links:
-        return []
+def _coerce_confidence(value) -> int | None:
+    try:
+        confidence = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, confidence))
 
-    targets = _select_target_candidates(organic_keywords)
-    donors = _select_source_candidates(top_pages, min_traffic=500)
-    existing_pairs = _build_existing_link_pairs(internal_links)
 
+def _light_prefilter_donors(
+    donors: list[dict],
+    target: dict,
+    page_map: dict[str, dict],
+    max_candidates: int = 15,
+) -> list[dict]:
+    target_profile = page_map.get(target["target_page"]) or {}
+    target_tokens = set(target_profile.get("topic_tokens") or set()) | _text_tokens(target["target_page_keyword"])
+    target_section = target_profile.get("section") or _first_path_segment(target["target_page"])
+
+    ranked = []
+    for donor in donors:
+        donor_profile = page_map.get(donor["source_page"]) or {}
+        donor_tokens = set(donor_profile.get("topic_tokens") or set()) | _text_tokens(donor.get("source_top_keyword", ""))
+        overlap = len(donor_tokens & target_tokens)
+        same_section = bool(target_section and donor_profile.get("section") == target_section)
+        if overlap == 0 and not same_section:
+            continue
+        heuristic = (overlap * 3) + (4 if same_section else 0) + min(int(donor.get("source_page_traffic") or 0) // 250, 8)
+        ranked.append((heuristic, donor))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    filtered = [item[1] for item in ranked[:max_candidates]]
+    if len(filtered) >= min(max_candidates, 8):
+        return filtered
+
+    seen = {row["source_page"] for row in filtered}
+    for donor in donors:
+        if donor["source_page"] in seen:
+            continue
+        filtered.append(donor)
+        seen.add(donor["source_page"])
+        if len(filtered) >= min(max_candidates, len(donors)):
+            break
+    return filtered[:max_candidates]
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(lambda exc: True),
+)
+def _openai_json_response(system_prompt: str, payload: dict) -> dict:
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY is required for AI internal linking suggestions")
+    response = openai_client.chat.completions.create(
+        model=INTERNAL_LINKING_MODEL,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+    )
+    content = response.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+def _build_target_payload(target: dict, page_map: dict[str, dict], target_site: str) -> dict:
+    profile = page_map.get(target["target_page"], {})
+    return {
+        "website": target_site,
+        "url": target["target_page"],
+        "title": profile.get("title") or _infer_page_title(target["target_page"], target["target_page_keyword"]),
+        "meta_description": profile.get("meta_description") or "",
+        "top_keywords": profile.get("top_keywords") or [{"keyword": target["target_page_keyword"], "volume": target["target_page_volume"]}],
+        "traffic": profile.get("traffic") or 0,
+        "section": profile.get("section") or _first_path_segment(target["target_page"]),
+        "primary_keyword": target["target_page_keyword"],
+        "position": target["target_page_position"],
+        "volume": target["target_page_volume"],
+    }
+
+
+def _build_donor_payload(donor: dict, page_map: dict[str, dict], source_site: str) -> dict:
+    profile = page_map.get(donor["source_page"], {})
+    return {
+        "website": source_site,
+        "url": donor["source_page"],
+        "title": profile.get("title") or _infer_page_title(donor["source_page"], donor.get("source_top_keyword", "")),
+        "meta_description": profile.get("meta_description") or "",
+        "top_keywords": profile.get("top_keywords") or (
+            [{"keyword": donor.get("source_top_keyword", ""), "volume": 0}] if donor.get("source_top_keyword") else []
+        ),
+        "traffic": donor.get("source_page_traffic") or profile.get("traffic") or 0,
+        "section": profile.get("section") or _first_path_segment(donor["source_page"]),
+        "primary_keyword": profile.get("primary_keyword") or donor.get("source_top_keyword", ""),
+    }
+
+
+def _layer1_generate_internal_links(
+    source_site: str,
+    target_site: str,
+    target_payload: dict,
+    donor_payloads: list[dict],
+    scope: str,
+) -> list[dict]:
+    result = _openai_json_response(
+        system_prompt=(
+            "You are an internal linking strategist for SEO. "
+            "Given one target page and a set of candidate donor pages, choose only the donor pages that should naturally link to the target. "
+            "Use topic overlap, reader usefulness, keyword alignment, and site section context. "
+            "Do not force weak matches. Return JSON with a `suggestions` array only. "
+            "Each suggestion must include: source_page, anchor_text, reason, confidence."
+        ),
+        payload={
+            "scope": scope,
+            "source_site": source_site,
+            "target_site": target_site,
+            "target_page": target_payload,
+            "candidate_donor_pages": donor_payloads,
+            "instructions": {
+                "max_suggestions": min(5, len(donor_payloads)),
+                "confidence_scale": "0-100 integer",
+                "anchor_rule": "Anchor text must be natural, descriptive, and fit the donor page context.",
+                "reason_rule": "Reason must be one sentence in plain English and reference the actual page topic or keyword overlap.",
+            },
+        },
+    )
+    suggestions = result.get("suggestions") or []
+    return suggestions if isinstance(suggestions, list) else []
+
+
+def _layer2_validate_internal_link(
+    source_site: str,
+    target_site: str,
+    target_payload: dict,
+    donor_payload: dict,
+    candidate: dict,
+    scope: str,
+) -> dict:
+    return _openai_json_response(
+        system_prompt=(
+            "You are a skeptical SEO reviewer validating internal linking suggestions. "
+            "Reject any stretch, weak topic match, vague anchor, or suggestion that feels only loosely related. "
+            "Approve only if the donor page would genuinely help a reader navigate to the target page. "
+            "Return JSON only with: approved, confidence, reason, anchor_text."
+        ),
+        payload={
+            "scope": scope,
+            "source_site": source_site,
+            "target_site": target_site,
+            "target_page": target_payload,
+            "donor_page": donor_payload,
+            "candidate_suggestion": candidate,
+            "instructions": {
+                "confidence_scale": "0-100 integer",
+                "reason_rule": "Keep reason to one sentence and explain the actual topical connection.",
+            },
+        },
+    )
+
+
+def _build_rule_based_suggestions(
+    site_name: str,
+    targets: list[dict],
+    donors: list[dict],
+    existing_pairs: set[tuple[str, str]] | None,
+    target_site_name: str,
+    scope: str,
+    limit: int,
+) -> list[dict]:
     suggestions = []
     seen = set()
     for target in targets:
@@ -665,6 +947,8 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
             source_page = donor["source_page"]
             if source_page == target_page:
                 continue
+            if existing_pairs is not None and (source_page, target_page) in existing_pairs:
+                continue
             if not _topic_related(
                 source_page,
                 target_page,
@@ -672,10 +956,15 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
                 donor.get("source_top_keyword", ""),
             ):
                 continue
-            if (source_page, target_page) in existing_pairs:
-                continue
 
-            dedupe_key = (site_name, source_page, target_page, target["target_page_keyword"])
+            dedupe_key = (
+                scope,
+                site_name,
+                source_page,
+                target_site_name,
+                target_page,
+                target["target_page_keyword"],
+            )
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -688,8 +977,8 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
             suggestions.append({
                 "website": site_name,
                 "source_website": site_name,
-                "target_website": site_name,
-                "suggestion_scope": "within_site",
+                "target_website": target_site_name,
+                "suggestion_scope": scope,
                 "source_page": source_page,
                 "source_page_traffic": donor["source_page_traffic"],
                 "target_page": target_page,
@@ -700,14 +989,224 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
                 "existing_link": False,
                 "score": score,
                 "status": "pending",
+                "reason": (
+                    f"Both pages align around {target['target_page_keyword']}, "
+                    f"so linking {source_page} to {target_page} would support that topic."
+                ),
+                "ai_confidence": None,
             })
-
     suggestions.sort(key=lambda row: (row["score"], row["source_page_traffic"], row["target_page_volume"]), reverse=True)
     return suggestions[:limit]
 
 
+def _generate_ai_suggestions_for_scope(
+    source_site: str,
+    target_site: str,
+    targets: list[dict],
+    donors: list[dict],
+    source_page_map: dict[str, dict],
+    target_page_map: dict[str, dict],
+    scope: str,
+    limit: int,
+    existing_pairs: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    if not openai_client:
+        logger.warning(
+            "OPENAI_API_KEY missing; falling back to deterministic internal linking for %s (%s)",
+            source_site,
+            scope,
+        )
+        return _build_rule_based_suggestions(
+            site_name=source_site,
+            targets=targets,
+            donors=donors,
+            existing_pairs=existing_pairs,
+            target_site_name=target_site,
+            scope=scope,
+            limit=limit,
+        )
+
+    logger.info(
+        "  internal_linking[%s]: %s -> %s | %d targets, %d donor pages",
+        scope,
+        source_site,
+        target_site,
+        len(targets),
+        len(donors),
+    )
+    suggestions = []
+    seen = set()
+    for index, target in enumerate(targets, start=1):
+        target_page = target["target_page"]
+        target_payload = _build_target_payload(target, target_page_map, target_site)
+        candidate_donors = []
+        for donor in _light_prefilter_donors(donors, target, source_page_map):
+            source_page = donor["source_page"]
+            if source_page == target_page:
+                continue
+            if existing_pairs is not None and (source_page, target_page) in existing_pairs:
+                continue
+            candidate_donors.append(donor)
+
+        if not candidate_donors:
+            logger.info(
+                "    target %d/%d skipped (%s): no donor candidates after prefilter",
+                index,
+                len(targets),
+                target_page,
+            )
+            continue
+
+        donor_payloads = [_build_donor_payload(donor, source_page_map, source_site) for donor in candidate_donors]
+        donor_lookup = {payload["url"]: payload for payload in donor_payloads}
+        donor_rows = {donor["source_page"]: donor for donor in candidate_donors}
+        logger.info(
+            "    target %d/%d | %s | %d candidate donors",
+            index,
+            len(targets),
+            target_page,
+            len(candidate_donors),
+        )
+
+        try:
+            layer1_suggestions = _layer1_generate_internal_links(
+                source_site=source_site,
+                target_site=target_site,
+                target_payload=target_payload,
+                donor_payloads=donor_payloads,
+                scope=scope,
+            )
+        except Exception as exc:
+            logger.warning(
+                "AI internal linking layer 1 failed for %s → %s (%s): %s",
+                source_site,
+                target_site,
+                target_page,
+                str(exc)[:160],
+            )
+            continue
+        logger.info(
+            "      layer1 returned %d suggestions for %s",
+            len(layer1_suggestions),
+            target_page,
+        )
+
+        approved_for_target = 0
+        for candidate in layer1_suggestions:
+            source_page = _normalize_url(candidate.get("source_page", ""))
+            donor_row = donor_rows.get(source_page)
+            donor_payload = donor_lookup.get(source_page)
+            if not donor_row or not donor_payload:
+                continue
+
+            dedupe_key = (scope, source_site, source_page, target_site, target_page, target["target_page_keyword"])
+            if dedupe_key in seen:
+                continue
+
+            try:
+                validation = _layer2_validate_internal_link(
+                    source_site=source_site,
+                    target_site=target_site,
+                    target_payload=target_payload,
+                    donor_payload=donor_payload,
+                    candidate=candidate,
+                    scope=scope,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "AI internal linking layer 2 failed for %s → %s (%s): %s",
+                    source_site,
+                    target_site,
+                    source_page,
+                    str(exc)[:160],
+                )
+                continue
+
+            if not validation.get("approved"):
+                continue
+
+            final_confidence = _coerce_confidence(validation.get("confidence"))
+            if final_confidence is None:
+                final_confidence = _coerce_confidence(candidate.get("confidence"))
+            if final_confidence is None:
+                continue
+
+            final_reason = (validation.get("reason") or candidate.get("reason") or "").strip()
+            final_anchor = (validation.get("anchor_text") or candidate.get("anchor_text") or target["target_page_keyword"]).strip()
+            if not final_reason or not final_anchor:
+                continue
+
+            seen.add(dedupe_key)
+            score = int(
+                (donor_row["source_page_traffic"] / 100)
+                + (100 - target["target_page_position"])
+                + (target["target_page_volume"] / 1000)
+            )
+            suggestions.append({
+                "website": source_site,
+                "source_website": source_site,
+                "target_website": target_site,
+                "suggestion_scope": scope,
+                "source_page": source_page,
+                "source_page_traffic": donor_row["source_page_traffic"],
+                "target_page": target_page,
+                "target_page_keyword": target["target_page_keyword"],
+                "target_page_position": target["target_page_position"],
+                "target_page_volume": target["target_page_volume"],
+                "suggested_anchor": final_anchor,
+                "existing_link": False,
+                "score": score,
+                "status": "pending",
+                "reason": final_reason,
+                "ai_confidence": final_confidence,
+            })
+            approved_for_target += 1
+
+        logger.info(
+            "      layer2 approved %d suggestions for %s",
+            approved_for_target,
+            target_page,
+        )
+
+    suggestions.sort(
+        key=lambda row: (
+            row["score"],
+            row.get("ai_confidence") or 0,
+            row["source_page_traffic"],
+            row["target_page_volume"],
+        ),
+        reverse=True,
+    )
+    return suggestions[:limit]
+
+
+def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: int = 30) -> list[dict]:
+    """Build AI-validated internal-link suggestions for one website."""
+    organic_keywords = site_data.get("organic_keywords")
+    top_pages = site_data.get("top_pages")
+    internal_links = site_data.get("internal_links")
+    if not organic_keywords or not top_pages or not internal_links:
+        return []
+
+    targets = _select_target_candidates(organic_keywords)
+    donors = _select_source_candidates(top_pages, min_traffic=500)
+    existing_pairs = _build_existing_link_pairs(internal_links)
+    page_map = _build_page_enrichment(site_name, site_data)
+    return _generate_ai_suggestions_for_scope(
+        source_site=site_name,
+        target_site=site_name,
+        targets=targets,
+        donors=donors,
+        source_page_map=page_map,
+        target_page_map=page_map,
+        scope="within_site",
+        limit=limit,
+        existing_pairs=existing_pairs,
+    )
+
+
 def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source: int = 30) -> list[dict]:
-    """Build deterministic cross-platform link suggestions across the Ztudium ecosystem."""
+    """Build AI-validated cross-platform link suggestions across the Ztudium ecosystem."""
     site_inputs = {}
     for site_name, site_data in parsed_data.items():
         organic_keywords = site_data.get("organic_keywords")
@@ -721,65 +1220,36 @@ def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source
         site_inputs[site_name] = {
             "targets": targets,
             "donors": donors,
+            "page_map": _build_page_enrichment(site_name, site_data),
         }
 
     suggestions = []
-    seen = set()
     for source_site, source_data in site_inputs.items():
         source_suggestions = []
         for target_site, target_data in site_inputs.items():
             if source_site == target_site:
                 continue
-            for donor in source_data["donors"]:
-                source_page = donor["source_page"]
-                for target in target_data["targets"]:
-                    target_page = target["target_page"]
-                    if source_page == target_page:
-                        continue
-                    if not _topic_related(
-                        source_page,
-                        target_page,
-                        target["target_page_keyword"],
-                        donor.get("source_top_keyword", ""),
-                    ):
-                        continue
-
-                    dedupe_key = (
-                        "cross_platform",
-                        source_site,
-                        source_page,
-                        target_site,
-                        target_page,
-                        target["target_page_keyword"],
-                    )
-                    if dedupe_key in seen:
-                        continue
-                    seen.add(dedupe_key)
-
-                    score = int(
-                        (donor["source_page_traffic"] / 100)
-                        + (100 - target["target_page_position"])
-                        + (target["target_page_volume"] / 1000)
-                    )
-                    source_suggestions.append({
-                        "website": source_site,
-                        "source_website": source_site,
-                        "target_website": target_site,
-                        "suggestion_scope": "cross_platform",
-                        "source_page": source_page,
-                        "source_page_traffic": donor["source_page_traffic"],
-                        "target_page": target_page,
-                        "target_page_keyword": target["target_page_keyword"],
-                        "target_page_position": target["target_page_position"],
-                        "target_page_volume": target["target_page_volume"],
-                        "suggested_anchor": target["target_page_keyword"],
-                        "existing_link": False,
-                        "score": score,
-                        "status": "pending",
-                    })
+            source_suggestions.extend(
+                _generate_ai_suggestions_for_scope(
+                    source_site=source_site,
+                    target_site=target_site,
+                    targets=target_data["targets"],
+                    donors=source_data["donors"],
+                    source_page_map=source_data["page_map"],
+                    target_page_map=target_data["page_map"],
+                    scope="cross_platform",
+                    limit=limit_per_source,
+                    existing_pairs=None,
+                )
+            )
 
         source_suggestions.sort(
-            key=lambda row: (row["score"], row["source_page_traffic"], row["target_page_volume"]),
+            key=lambda row: (
+                row["score"],
+                row.get("ai_confidence") or 0,
+                row["source_page_traffic"],
+                row["target_page_volume"],
+            ),
             reverse=True,
         )
         suggestions.extend(source_suggestions[:limit_per_source])
@@ -839,6 +1309,17 @@ def batch_upsert(client, table, rows, conflict_cols):
         # Steady pacing to avoid hitting API limits.
         time.sleep(0.2)
     return upserted
+
+
+def _dedupe_rows_by_keys(rows: list[dict], keys: list[str]) -> list[dict]:
+    """Keep only the last row for each unique key combination within a batch."""
+    deduped: dict[tuple, dict] = {}
+    for row in rows:
+        key = tuple(row.get(k) for k in keys)
+        if any(value is None for value in key):
+            continue
+        deduped[key] = row
+    return list(deduped.values())
 
 
 def _is_retryable_upsert_error(exc: Exception) -> bool:
@@ -984,6 +1465,8 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     ref_domains_has_ingestion_run_id = _supports_column(client, "ahrefs_referring_domains", "ingestion_run_id")
     broken_backlinks_has_ingestion_run_id = _supports_column(client, "ahrefs_broken_backlinks", "ingestion_run_id")
     competitors_has_ingestion_run_id = _supports_column(client, "ahrefs_competitors", "ingestion_run_id")
+    internal_links_has_reason = _supports_column(client, "internal_linking_suggestions", "reason")
+    internal_links_has_ai_confidence = _supports_column(client, "internal_linking_suggestions", "ai_confidence")
     websites_in_run = sorted(parsed_data.keys())
 
     # Overviews
@@ -1118,6 +1601,11 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
                 if run_id and broken_backlinks_has_ingestion_run_id:
                     bb_row["ingestion_run_id"] = run_id
                 bb_rows.append(bb_row)
+    pre_dedupe_count = len(bb_rows)
+    bb_rows = _dedupe_rows_by_keys(bb_rows, ["date", "website", "referring_page"])
+    duplicate_count = pre_dedupe_count - len(bb_rows)
+    if duplicate_count > 0:
+        logger.info("  ahrefs_broken_backlinks: removed %d duplicate rows before upsert", duplicate_count)
     replace_snapshot_rows(client, "ahrefs_broken_backlinks", bb_scopes, "ahrefs_broken_backlinks")
     c = batch_upsert(client, "ahrefs_broken_backlinks", bb_rows, "date,website,referring_page")
     logger.info("  ahrefs_broken_backlinks: %d upserted", c)
@@ -1187,6 +1675,12 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
     suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+    if not internal_links_has_reason or not internal_links_has_ai_confidence:
+        for row in suggestion_rows:
+            if not internal_links_has_reason:
+                row.pop("reason", None)
+            if not internal_links_has_ai_confidence:
+                row.pop("ai_confidence", None)
     c = batch_upsert(
         client,
         "internal_linking_suggestions",

@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET, WEBSITES
 
 try:
     from dotenv import load_dotenv
@@ -57,8 +57,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-INTERNAL_LINKING_MODEL = os.getenv("INTERNAL_LINKING_MODEL", "gpt-4o")
+INTERNAL_LINKING_MODEL = "gpt-4o"
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
+
+SITE_CONTEXT = {
+    site["name"]: {
+        "category": site.get("category", ""),
+        "audience": site.get("audience", ""),
+    }
+    for site in WEBSITES
+}
 
 # ── Domain mapping ────────────────────────────────────────────
 WEBSITE_MAP = {
@@ -460,6 +468,16 @@ def parse_top_pages(filepath, website):
             "top_keyword_volume": _parse_number(row.get("Current top keyword: Volume", row.get("Top keyword: Volume", 0))),
             "title": row.get("Title", row.get("Page title", "")),
             "meta_description": row.get("Meta description", row.get("Description", "")),
+            "content_summary": row.get(
+                "Content summary",
+                row.get(
+                    "Summary",
+                    row.get(
+                        "Excerpt",
+                        row.get("First paragraph", row.get("Introduction", row.get("Snippet", ""))),
+                    ),
+                ),
+            ),
             "ur": _parse_number(row.get("UR", 0)),
             "referring_domains": _parse_number(row.get("Current referring domains", 0)),
         })
@@ -627,13 +645,13 @@ def _select_source_candidates(top_pages: dict, min_traffic: int = 500) -> list[d
 
     strong_donors = [row for row in all_pages if row["source_page_traffic"] >= min_traffic]
     if len(strong_donors) >= 5:
-        return strong_donors[:25]
+        return strong_donors[:40]
 
     medium_donors = [row for row in all_pages if row["source_page_traffic"] >= 100]
     if medium_donors:
-        return medium_donors[:25]
+        return medium_donors[:40]
 
-    return all_pages[:10]
+    return all_pages[:20]
 
 
 def _humanize_token_text(text: str) -> str:
@@ -662,14 +680,20 @@ def _build_keyword_map(organic_keywords: dict) -> dict[str, list[dict]]:
             "keyword": keyword,
             "volume": int(row.get("volume") or 0),
             "traffic": int(row.get("traffic") or 0),
+            "position": int(row.get("position") or 0),
         })
 
     for url, keywords in grouped.items():
         grouped[url] = sorted(
             keywords,
-            key=lambda item: (item.get("volume") or 0, item.get("traffic") or 0, item.get("keyword") or ""),
+            key=lambda item: (
+                item.get("volume") or 0,
+                -(item.get("position") or 999),
+                item.get("traffic") or 0,
+                item.get("keyword") or "",
+            ),
             reverse=True,
-        )[:3]
+        )[:5]
     return grouped
 
 
@@ -684,6 +708,7 @@ def _build_page_enrichment(site_name: str, site_data: dict) -> dict[str, dict]:
     }
 
     enriched: dict[str, dict] = {}
+    site_context = SITE_CONTEXT.get(site_name, {"category": "", "audience": ""})
     for url in sorted(set(keywords_by_url.keys()) | set(top_pages_by_url.keys())):
         top_page = top_pages_by_url.get(url, {})
         top_keywords = keywords_by_url.get(url, [])
@@ -698,39 +723,50 @@ def _build_page_enrichment(site_name: str, site_data: dict) -> dict[str, dict]:
         )
         title = (top_page.get("title") or "").strip() or _infer_page_title(url, primary_keyword)
         meta_description = (top_page.get("meta_description") or "").strip()
+        content_summary = (
+            (top_page.get("content_summary") or "").strip()
+            or meta_description
+        )
         section = _first_path_segment(url)
         keyword_summaries = [
             {
                 "keyword": item.get("keyword", ""),
                 "volume": int(item.get("volume") or 0),
+                "position": int(item.get("position") or 0),
             }
-            for item in top_keywords[:3]
+            for item in top_keywords[:5]
             if item.get("keyword")
         ]
         if not keyword_summaries and top_page.get("top_keyword"):
             keyword_summaries = [{
                 "keyword": top_page.get("top_keyword", ""),
                 "volume": int(top_page.get("top_keyword_volume") or 0),
+                "position": 0,
             }]
         topic_tokens = (
             _url_path_tokens(url)
             | _text_tokens(title)
             | _text_tokens(meta_description)
+            | _text_tokens(content_summary)
             | _text_tokens(primary_keyword)
         )
         for item in keyword_summaries:
             topic_tokens |= _text_tokens(item["keyword"])
+        topic_tokens |= _text_tokens(site_context.get("category", ""))
 
         enriched[url] = {
             "website": site_name,
             "url": url,
             "title": title,
             "meta_description": meta_description,
+            "content_summary": content_summary,
             "top_keywords": keyword_summaries,
             "traffic": traffic,
             "section": section,
             "topic_tokens": topic_tokens,
             "primary_keyword": primary_keyword,
+            "site_category": site_context.get("category", ""),
+            "site_audience": site_context.get("audience", ""),
         }
 
     return enriched
@@ -776,11 +812,38 @@ def _coerce_confidence(value) -> int | None:
     return max(0, min(100, confidence))
 
 
+def _split_reason_sentences(reason: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", (reason or "").strip()) if part.strip()]
+
+
+def _is_meaningful_reason(reason: str) -> bool:
+    text = (reason or "").strip()
+    if not text or len(text) < 140:
+        return False
+
+    sentences = _split_reason_sentences(text)
+    if len(sentences) < 3:
+        return False
+
+    lowered = text.lower()
+    generic_phrases = [
+        "both pages are related",
+        "same broad topic",
+        "same general theme",
+        "same industry",
+        "topically related",
+        "would support that topic",
+        "this link makes sense",
+        "would be useful",
+    ]
+    return not any(phrase in lowered for phrase in generic_phrases)
+
+
 def _light_prefilter_donors(
     donors: list[dict],
     target: dict,
     page_map: dict[str, dict],
-    max_candidates: int = 15,
+    max_candidates: int = 25,
 ) -> list[dict]:
     target_profile = page_map.get(target["target_page"]) or {}
     target_tokens = set(target_profile.get("topic_tokens") or set()) | _text_tokens(target["target_page_keyword"])
@@ -842,12 +905,15 @@ def _build_target_payload(target: dict, page_map: dict[str, dict], target_site: 
         "url": target["target_page"],
         "title": profile.get("title") or _infer_page_title(target["target_page"], target["target_page_keyword"]),
         "meta_description": profile.get("meta_description") or "",
+        "content_summary": profile.get("content_summary") or "",
         "top_keywords": profile.get("top_keywords") or [{"keyword": target["target_page_keyword"], "volume": target["target_page_volume"]}],
         "traffic": profile.get("traffic") or 0,
         "section": profile.get("section") or _first_path_segment(target["target_page"]),
         "primary_keyword": target["target_page_keyword"],
         "position": target["target_page_position"],
         "volume": target["target_page_volume"],
+        "site_category": profile.get("site_category") or SITE_CONTEXT.get(target_site, {}).get("category", ""),
+        "site_audience": profile.get("site_audience") or SITE_CONTEXT.get(target_site, {}).get("audience", ""),
     }
 
 
@@ -858,12 +924,15 @@ def _build_donor_payload(donor: dict, page_map: dict[str, dict], source_site: st
         "url": donor["source_page"],
         "title": profile.get("title") or _infer_page_title(donor["source_page"], donor.get("source_top_keyword", "")),
         "meta_description": profile.get("meta_description") or "",
+        "content_summary": profile.get("content_summary") or "",
         "top_keywords": profile.get("top_keywords") or (
             [{"keyword": donor.get("source_top_keyword", ""), "volume": 0}] if donor.get("source_top_keyword") else []
         ),
         "traffic": donor.get("source_page_traffic") or profile.get("traffic") or 0,
         "section": profile.get("section") or _first_path_segment(donor["source_page"]),
         "primary_keyword": profile.get("primary_keyword") or donor.get("source_top_keyword", ""),
+        "site_category": profile.get("site_category") or SITE_CONTEXT.get(source_site, {}).get("category", ""),
+        "site_audience": profile.get("site_audience") or SITE_CONTEXT.get(source_site, {}).get("audience", ""),
     }
 
 
@@ -876,10 +945,20 @@ def _layer1_generate_internal_links(
 ) -> list[dict]:
     result = _openai_json_response(
         system_prompt=(
-            "You are an internal linking strategist for SEO. "
-            "Given one target page and a set of candidate donor pages, choose only the donor pages that should naturally link to the target. "
-            "Use topic overlap, reader usefulness, keyword alignment, and site section context. "
-            "Do not force weak matches. Return JSON with a `suggestions` array only. "
+            "You are an internal linking strategist. "
+            f"The donor pages are from {source_site} and the target page is on {target_site}. "
+            "For cross-platform suggestions, the donor and target are on different sites — respect what each site is about and who it serves. "
+            "You will be given full enriched context for one target page and candidate donor pages. "
+            "Use the site niche, audience, page title, meta description, content summary, top keywords, traffic, and section context. "
+            "Only suggest links that are editorially useful for a real reader. "
+            "Do not guess what pages are about. Use only the evidence provided. "
+            "For every suggestion, write a strong detailed reason. "
+            "Sentence one must state the exact topical connection between the donor page and the target page. "
+            "Then write two or three more sentences explaining why a real reader on the donor page would benefit from clicking through, "
+            "what specific value they get, which keyword or content overlap supports the suggestion, "
+            "and why the link is editorially justified in context. "
+            "Never use vague phrases like 'both pages are related' or 'same broad topic'. "
+            "Return JSON with a `suggestions` array only. "
             "Each suggestion must include: source_page, anchor_text, reason, confidence."
         ),
         payload={
@@ -889,10 +968,14 @@ def _layer1_generate_internal_links(
             "target_page": target_payload,
             "candidate_donor_pages": donor_payloads,
             "instructions": {
-                "max_suggestions": min(5, len(donor_payloads)),
+                "max_suggestions": min(15, len(donor_payloads)),
                 "confidence_scale": "0-100 integer",
                 "anchor_rule": "Anchor text must be natural, descriptive, and fit the donor page context.",
-                "reason_rule": "Reason must be one sentence in plain English and reference the actual page topic or keyword overlap.",
+                "reason_rule": (
+                    "Reason must be 3 to 4 sentences. Sentence 1 = exact topical connection. "
+                    "Sentences 2 to 4 = concrete reader benefit, content/keyword overlap, and editorial justification."
+                ),
+                "site_rule": "Respect what the source site and target site are about and who they serve.",
             },
         },
     )
@@ -900,34 +983,72 @@ def _layer1_generate_internal_links(
     return suggestions if isinstance(suggestions, list) else []
 
 
-def _layer2_validate_internal_link(
+def _layer2_validate_internal_links_batch(
     source_site: str,
     target_site: str,
     target_payload: dict,
-    donor_payload: dict,
-    candidate: dict,
+    donor_payloads: dict[str, dict],
+    candidates: list[dict],
     scope: str,
-) -> dict:
-    return _openai_json_response(
+) -> list[dict]:
+    review_payload = []
+    for candidate in candidates:
+        source_page = _normalize_url(candidate.get("source_page", ""))
+        donor_payload = donor_payloads.get(source_page)
+        if not donor_payload:
+            continue
+        review_payload.append({
+            "donor_page": donor_payload,
+            "candidate": candidate,
+        })
+
+    if not review_payload:
+        return []
+
+    result = _openai_json_response(
         system_prompt=(
-            "You are a skeptical SEO reviewer validating internal linking suggestions. "
-            "Reject any stretch, weak topic match, vague anchor, or suggestion that feels only loosely related. "
-            "Approve only if the donor page would genuinely help a reader navigate to the target page. "
-            "Return JSON only with: approved, confidence, reason, anchor_text."
+            f"You are a skeptical SEO reviewer validating internal linking suggestions for the {source_site} website. "
+            "Reject anything where the connection is only the same broad category, same industry, or same vague theme. "
+            "Approve only if there is a clear, specific, editorial reason a reader would benefit from following the link from this donor page to this target page. "
+            "Only approve if confidence is 75 or above. If your confidence is below 75, reject the suggestion. "
+            "If the anchor feels generic, forced, or weak, reject it. "
+            "For approved suggestions, the reason must be a strong 3 to 4 sentence explanation. "
+            "Sentence one must state the exact topical connection. "
+            "The remaining sentences must explain the concrete reader benefit, the exact keyword or content overlap, "
+            "and why the link fits naturally in the donor-page context. "
+            "Do not approve generic language like 'both pages are related' or 'same broad topic'. "
+            "Review every suggestion independently. "
+            "Return JSON with a `results` array only. "
+            "Each result must include: source_page, approved, confidence, reason, anchor_text. "
+            "For rejected suggestions, one clear sentence is enough. For approved suggestions, use the full detailed format."
         ),
         payload={
             "scope": scope,
             "source_site": source_site,
             "target_site": target_site,
             "target_page": target_payload,
-            "donor_page": donor_payload,
-            "candidate_suggestion": candidate,
+            "suggestions_to_review": review_payload,
             "instructions": {
+                "task": "Review every suggestion in suggestions_to_review independently.",
                 "confidence_scale": "0-100 integer",
-                "reason_rule": "Keep reason to one sentence and explain the actual topical connection.",
+                "approval_threshold": "Only approve if confidence is 75 or above.",
+                "reason_rule": (
+                    "Approved suggestions must have a 3 to 4 sentence reason with exact topical connection, "
+                    "reader benefit, content overlap, and editorial fit. Rejected suggestions can use one sentence."
+                ),
+                "rejection_rule": (
+                    "Reject if the only connection is that both pages are in the same industry, "
+                    "same broad topic, or same general theme. "
+                    "A valid approval requires a specific, clear reason why a real reader "
+                    "on the donor page would benefit from clicking through to the target page. "
+                    "If you cannot state that specific reason, reject it."
+                ),
+                "output_format": "Return JSON with a `results` array. Each item must include: source_page, approved, confidence, reason, anchor_text.",
             },
         },
     )
+    results = result.get("results") or []
+    return results if isinstance(results, list) else []
 
 
 def _build_rule_based_suggestions(
@@ -1011,20 +1132,7 @@ def _generate_ai_suggestions_for_scope(
     existing_pairs: set[tuple[str, str]] | None = None,
 ) -> list[dict]:
     if not openai_client:
-        logger.warning(
-            "OPENAI_API_KEY missing; falling back to deterministic internal linking for %s (%s)",
-            source_site,
-            scope,
-        )
-        return _build_rule_based_suggestions(
-            site_name=source_site,
-            targets=targets,
-            donors=donors,
-            existing_pairs=existing_pairs,
-            target_site_name=target_site,
-            scope=scope,
-            limit=limit,
-        )
+        raise RuntimeError("OPENAI_API_KEY is required for internal linking generation")
 
     logger.info(
         "  internal_linking[%s]: %s -> %s | %d targets, %d donor pages",
@@ -1036,6 +1144,7 @@ def _generate_ai_suggestions_for_scope(
     )
     suggestions = []
     seen = set()
+    minimum_scope_suggestions = min(4, limit)
     for index, target in enumerate(targets, start=1):
         target_page = target["target_page"]
         target_payload = _build_target_payload(target, target_page_map, target_site)
@@ -1092,48 +1201,53 @@ def _generate_ai_suggestions_for_scope(
         )
 
         approved_for_target = 0
-        for candidate in layer1_suggestions:
-            source_page = _normalize_url(candidate.get("source_page", ""))
+        try:
+            validation_results = _layer2_validate_internal_links_batch(
+                source_site=source_site,
+                target_site=target_site,
+                target_payload=target_payload,
+                donor_payloads=donor_lookup,
+                candidates=layer1_suggestions,
+                scope=scope,
+            )
+        except Exception as exc:
+            logger.warning(
+                "AI internal linking layer 2 failed for %s → %s (%s): %s",
+                source_site,
+                target_site,
+                target_page,
+                str(exc)[:160],
+            )
+            continue
+
+        layer1_lookup = {
+            _normalize_url(candidate.get("source_page", "")): candidate
+            for candidate in layer1_suggestions
+            if _normalize_url(candidate.get("source_page", ""))
+        }
+
+        for validation in validation_results:
+            source_page = _normalize_url(validation.get("source_page", ""))
             donor_row = donor_rows.get(source_page)
-            donor_payload = donor_lookup.get(source_page)
-            if not donor_row or not donor_payload:
+            candidate = layer1_lookup.get(source_page)
+            if not donor_row or not candidate:
                 continue
 
             dedupe_key = (scope, source_site, source_page, target_site, target_page, target["target_page_keyword"])
             if dedupe_key in seen:
                 continue
 
-            try:
-                validation = _layer2_validate_internal_link(
-                    source_site=source_site,
-                    target_site=target_site,
-                    target_payload=target_payload,
-                    donor_payload=donor_payload,
-                    candidate=candidate,
-                    scope=scope,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "AI internal linking layer 2 failed for %s → %s (%s): %s",
-                    source_site,
-                    target_site,
-                    source_page,
-                    str(exc)[:160],
-                )
-                continue
-
-            if not validation.get("approved"):
-                continue
-
             final_confidence = _coerce_confidence(validation.get("confidence"))
             if final_confidence is None:
                 final_confidence = _coerce_confidence(candidate.get("confidence"))
-            if final_confidence is None:
+            if final_confidence is None or final_confidence < 75:
+                continue
+            if not validation.get("approved"):
                 continue
 
             final_reason = (validation.get("reason") or candidate.get("reason") or "").strip()
             final_anchor = (validation.get("anchor_text") or candidate.get("anchor_text") or target["target_page_keyword"]).strip()
-            if not final_reason or not final_anchor:
+            if not final_anchor or not _is_meaningful_reason(final_reason):
                 continue
 
             seen.add(dedupe_key)
@@ -1167,6 +1281,135 @@ def _generate_ai_suggestions_for_scope(
             approved_for_target,
             target_page,
         )
+
+    if len(suggestions) < minimum_scope_suggestions and donors:
+        fallback_limit = min(40, max(25, len(donors)))
+        logger.info(
+            "  internal_linking[%s]: %s -> %s below floor (%d/%d). Running broader fallback pass with %d donors.",
+            scope,
+            source_site,
+            target_site,
+            len(suggestions),
+            minimum_scope_suggestions,
+            fallback_limit,
+        )
+        for index, target in enumerate(targets, start=1):
+            if len(suggestions) >= minimum_scope_suggestions:
+                break
+
+            target_page = target["target_page"]
+            target_payload = _build_target_payload(target, target_page_map, target_site)
+            candidate_donors = []
+            for donor in _light_prefilter_donors(donors, target, source_page_map, max_candidates=fallback_limit):
+                source_page = donor["source_page"]
+                if source_page == target_page:
+                    continue
+                if existing_pairs is not None and (source_page, target_page) in existing_pairs:
+                    continue
+                candidate_donors.append(donor)
+
+            if not candidate_donors:
+                continue
+
+            donor_payloads = [_build_donor_payload(donor, source_page_map, source_site) for donor in candidate_donors]
+            donor_lookup = {payload["url"]: payload for payload in donor_payloads}
+            donor_rows = {donor["source_page"]: donor for donor in candidate_donors}
+            logger.info(
+                "    [fallback] target %d/%d | %s | %d candidate donors",
+                index,
+                len(targets),
+                target_page,
+                len(candidate_donors),
+            )
+
+            try:
+                layer1_suggestions = _layer1_generate_internal_links(
+                    source_site=source_site,
+                    target_site=target_site,
+                    target_payload=target_payload,
+                    donor_payloads=donor_payloads,
+                    scope=scope,
+                )
+                validation_results = _layer2_validate_internal_links_batch(
+                    source_site=source_site,
+                    target_site=target_site,
+                    target_payload=target_payload,
+                    donor_payloads=donor_lookup,
+                    candidates=layer1_suggestions,
+                    scope=scope,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "AI internal linking fallback failed for %s -> %s (%s): %s",
+                    source_site,
+                    target_site,
+                    target_page,
+                    str(exc)[:160],
+                )
+                continue
+
+            layer1_lookup = {
+                _normalize_url(candidate.get("source_page", "")): candidate
+                for candidate in layer1_suggestions
+                if _normalize_url(candidate.get("source_page", ""))
+            }
+
+            approved_for_target = 0
+            for validation in validation_results:
+                source_page = _normalize_url(validation.get("source_page", ""))
+                donor_row = donor_rows.get(source_page)
+                candidate = layer1_lookup.get(source_page)
+                if not donor_row or not candidate:
+                    continue
+
+                dedupe_key = (scope, source_site, source_page, target_site, target_page, target["target_page_keyword"])
+                if dedupe_key in seen:
+                    continue
+
+                final_confidence = _coerce_confidence(validation.get("confidence"))
+                if final_confidence is None:
+                    final_confidence = _coerce_confidence(candidate.get("confidence"))
+                if final_confidence is None or final_confidence < 75:
+                    continue
+                if not validation.get("approved"):
+                    continue
+
+                final_reason = (validation.get("reason") or candidate.get("reason") or "").strip()
+                final_anchor = (validation.get("anchor_text") or candidate.get("anchor_text") or target["target_page_keyword"]).strip()
+                if not final_anchor or not _is_meaningful_reason(final_reason):
+                    continue
+
+                seen.add(dedupe_key)
+                score = int(
+                    (donor_row["source_page_traffic"] / 100)
+                    + (100 - target["target_page_position"])
+                    + (target["target_page_volume"] / 1000)
+                )
+                suggestions.append({
+                    "website": source_site,
+                    "source_website": source_site,
+                    "target_website": target_site,
+                    "suggestion_scope": scope,
+                    "source_page": source_page,
+                    "source_page_traffic": donor_row["source_page_traffic"],
+                    "target_page": target_page,
+                    "target_page_keyword": target["target_page_keyword"],
+                    "target_page_position": target["target_page_position"],
+                    "target_page_volume": target["target_page_volume"],
+                    "suggested_anchor": final_anchor,
+                    "existing_link": False,
+                    "score": score,
+                    "status": "pending",
+                    "reason": final_reason,
+                    "ai_confidence": final_confidence,
+                })
+                approved_for_target += 1
+
+            logger.info(
+                "      [fallback] layer2 approved %d suggestions for %s",
+                approved_for_target,
+                target_page,
+            )
 
     suggestions.sort(
         key=lambda row: (
@@ -1446,7 +1689,7 @@ def _supports_column(client, table: str, column: str) -> bool:
     return _COLUMN_SUPPORT_CACHE[key]
 
 
-def upload_parsed_data(parsed_data, run_id: str | None = None):
+def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_only: bool = False):
     """Upload all parsed Ahrefs data to Supabase."""
     from supabase import create_client
 
@@ -1468,6 +1711,34 @@ def upload_parsed_data(parsed_data, run_id: str | None = None):
     internal_links_has_reason = _supports_column(client, "internal_linking_suggestions", "reason")
     internal_links_has_ai_confidence = _supports_column(client, "internal_linking_suggestions", "ai_confidence")
     websites_in_run = sorted(parsed_data.keys())
+
+    if internal_linking_only:
+        logger.info("  internal_linking_only mode: rebuilding internal_linking_suggestions only")
+        for ws in websites_in_run:
+            deleted = delete_where(client, "internal_linking_suggestions", {"source_website": ws})
+            if deleted:
+                logger.info("  internal_linking_suggestions: removed %d stale rows for %s", deleted, ws)
+        suggestion_rows = []
+        for ws, data in parsed_data.items():
+            if not data.get("organic_keywords") or not data.get("top_pages") or not data.get("internal_links"):
+                logger.info("  internal_linking[%s]: skipped (missing one of organic keywords, top pages, or internal links)", ws)
+                continue
+            suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
+        suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+        if not internal_links_has_reason or not internal_links_has_ai_confidence:
+            for row in suggestion_rows:
+                if not internal_links_has_reason:
+                    row.pop("reason", None)
+                if not internal_links_has_ai_confidence:
+                    row.pop("ai_confidence", None)
+        c = batch_upsert(
+            client,
+            "internal_linking_suggestions",
+            suggestion_rows,
+            "suggestion_scope,source_website,source_page,target_website,target_page,target_page_keyword",
+        )
+        logger.info("  internal_linking_suggestions: %d upserted", c)
+        return
 
     # Overviews
     ov_rows = []
@@ -1700,12 +1971,19 @@ def main():
                         help="Date folder in storage (default: today)")
     parser.add_argument("--local-dir", default=None,
                         help="Process from local directory instead of downloading from storage")
+    parser.add_argument(
+        "--internal-linking-only",
+        action="store_true",
+        help="Only rebuild internal_linking_suggestions from Ahrefs organic keywords, top pages, and internal links",
+    )
     args = parser.parse_args()
 
     print()
     print("=" * 60)
     print("  PROCESS AHREFS CSVs")
     print(f"  Date folder: {args.date_folder}")
+    if args.internal_linking_only:
+        print("  Mode: internal-linking-only")
     print("=" * 60)
     run_started = time.time()
 
@@ -1736,6 +2014,8 @@ def main():
 
         if not website or not category:
             logger.debug("Skipping unrecognized: %s", filename)
+            continue
+        if args.internal_linking_only and category not in {"organic_keywords", "top_pages", "internal_links"}:
             continue
 
         if website not in parsed_data:
@@ -1778,7 +2058,7 @@ def main():
     websites_succeeded = []
     websites_failed = []
     try:
-        upload_parsed_data(parsed_data, run_id=run_id)
+        upload_parsed_data(parsed_data, run_id=run_id, internal_linking_only=args.internal_linking_only)
         for ws, sections in parsed_data.items():
             if sections:
                 websites_succeeded.append(ws)

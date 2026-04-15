@@ -598,8 +598,14 @@ def parse_internal_links(filepath, website):
     }
 
 
-def _select_target_candidates(organic_keywords: dict) -> list[dict]:
-    """Select one best target keyword per target URL."""
+def _select_target_candidates_for_thresholds(
+    organic_keywords: dict,
+    *,
+    min_position: int,
+    max_position: int,
+    min_volume: int,
+) -> list[dict]:
+    """Select one best target keyword per target URL for the given thresholds."""
     best_by_url = {}
     for row in organic_keywords.get("keywords", []):
         url = _normalize_url(row.get("url", ""))
@@ -608,7 +614,7 @@ def _select_target_candidates(organic_keywords: dict) -> list[dict]:
         keyword = (row.get("keyword") or "").strip()
         if not url or not keyword or position is None or volume is None:
             continue
-        if position < 4 or position > 10 or volume < 1000:
+        if position < min_position or position > max_position or volume < min_volume:
             continue
 
         current = best_by_url.get(url)
@@ -626,6 +632,33 @@ def _select_target_candidates(organic_keywords: dict) -> list[dict]:
         elif candidate["target_page_volume"] == current["target_page_volume"] and candidate["target_page_position"] < current["target_page_position"]:
             best_by_url[url] = candidate
     return list(best_by_url.values())
+
+
+def _select_target_candidates(organic_keywords: dict, site_name: str | None = None) -> list[dict]:
+    """Select target candidates, with a low-data fallback for thin sites."""
+    primary = _select_target_candidates_for_thresholds(
+        organic_keywords,
+        min_position=4,
+        max_position=10,
+        min_volume=1000,
+    )
+    if len(primary) >= 3:
+        return primary
+
+    fallback = _select_target_candidates_for_thresholds(
+        organic_keywords,
+        min_position=4,
+        max_position=20,
+        min_volume=500,
+    )
+    if site_name:
+        logger.info(
+            "  internal_linking[%s]: widened target eligibility from standard to fallback thresholds (primary=%d, fallback=%d)",
+            site_name,
+            len(primary),
+            len(fallback),
+        )
+    return fallback
 
 
 def _select_source_candidates(top_pages: dict, min_traffic: int = 500) -> list[dict]:
@@ -992,13 +1025,10 @@ def _layer1_generate_internal_links(
             f"The donor pages are from {source_site} and the target page is on {target_site}. "
             "For cross-platform suggestions, the donor and target are on different sites — respect what each site is about and who it serves. "
             "You will be given full enriched context for one target page and candidate donor pages. "
-            "Use the site niche, audience, page title, meta description, content summary, top keywords, traffic, and section context as your starting point. "
-            "Also use your world knowledge about the companies, brands, people, products, and topics involved to judge whether a genuine editorial connection exists. "
-            "If your world knowledge tells you the donor and target are not truly related, do not suggest the link even if there is superficial keyword or URL overlap. "
-            "If the page data is thin, use your world knowledge to fill the topic context, but do not invent relationships that are not real. "
+            "Use the site niche, audience, page title, meta description, content summary, top keywords, traffic, and section context. "
             "Only suggest links that are editorially useful for a real reader. "
-            "It is completely acceptable, and preferred, to return zero suggestions when no genuine connection exists. "
-            "Do not force connections just to fill a quota. "
+            "Do not guess what pages are about. Use only the evidence provided. "
+            "If a connection relies on a clearly incorrect factual claim, such as assuming one company owns another when it does not, do not suggest it. "
             "For every suggestion, write a strong detailed reason. "
             "Sentence one must state the exact topical connection between the donor page and the target page. "
             "Then write two or three more sentences explaining why a real reader on the donor page would benefit from clicking through, "
@@ -1574,7 +1604,7 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
         )
         return []
 
-    targets = _select_target_candidates(organic_keywords)
+    targets = _select_target_candidates(organic_keywords, site_name=site_name)
     donors = _select_source_candidates(top_pages, min_traffic=500)
     if not targets or not donors:
         logger.info(
@@ -1609,7 +1639,7 @@ def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source
         top_pages = site_data.get("top_pages")
         if not organic_keywords or not top_pages:
             continue
-        targets = _select_target_candidates(organic_keywords)
+        targets = _select_target_candidates(organic_keywords, site_name=site_name)
         donors = _select_source_candidates(top_pages, min_traffic=500)
         if not targets or not donors:
             logger.info(

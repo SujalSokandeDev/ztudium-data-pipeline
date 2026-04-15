@@ -875,6 +875,45 @@ def _is_meaningful_reason(reason: str) -> bool:
     return not any(phrase in lowered for phrase in generic_phrases)
 
 
+def _service_tokens_from_url(url: str) -> set[str]:
+    generic = {
+        "login", "signin", "sign", "in", "account", "access", "portal", "customer",
+        "service", "services", "phone", "number", "contact", "support", "help",
+        "hours", "hour", "page", "pages", "the", "and", "for", "near", "me",
+    }
+    return {token for token in (_url_path_tokens(url) | _text_tokens(urlparse(url).netloc)) if token not in generic}
+
+
+def _violates_hard_internal_link_rules(
+    *,
+    source_site: str,
+    target_site: str,
+    scope: str,
+    source_page: str,
+    target_page: str,
+) -> bool:
+    source_lower = (source_page or "").lower()
+    target_lower = (target_page or "").lower()
+
+    if (
+        scope == "within_site"
+        and source_site == "BusinessABC"
+        and "/wiki/" in source_lower
+        and "/wiki/" in target_lower
+    ):
+        return True
+
+    source_has_login = "login" in source_lower
+    target_has_contact_pattern = any(pattern in target_lower for pattern in ("phone", "contact", "customer"))
+    if source_has_login and target_has_contact_pattern:
+        if source_site != target_site:
+            return True
+        if not (_service_tokens_from_url(source_page) & _service_tokens_from_url(target_page)):
+            return True
+
+    return False
+
+
 def _light_prefilter_donors(
     donors: list[dict],
     target: dict,
@@ -1162,6 +1201,14 @@ def _save_layer1_candidates_direct(
         final_anchor = (candidate.get("anchor_text") or target["target_page_keyword"]).strip()
         if not final_reason or not final_anchor:
             continue
+        if _violates_hard_internal_link_rules(
+            source_site=source_site,
+            target_site=target_site,
+            scope=scope,
+            source_page=source_page,
+            target_page=target_page,
+        ):
+            continue
 
         seen.add(dedupe_key)
         score = int(
@@ -1410,6 +1457,14 @@ def _generate_ai_suggestions_for_scope(
             final_anchor = (validation.get("anchor_text") or candidate.get("anchor_text") or target["target_page_keyword"]).strip()
             if not final_anchor or not _is_meaningful_reason(final_reason):
                 continue
+            if _violates_hard_internal_link_rules(
+                source_site=source_site,
+                target_site=target_site,
+                scope=scope,
+                source_page=source_page,
+                target_page=target_page,
+            ):
+                continue
 
             seen.add(dedupe_key)
             score = int(
@@ -1558,6 +1613,14 @@ def _generate_ai_suggestions_for_scope(
                 final_anchor = (validation.get("anchor_text") or candidate.get("anchor_text") or target["target_page_keyword"]).strip()
                 if not final_anchor or not _is_meaningful_reason(final_reason):
                     continue
+                if _violates_hard_internal_link_rules(
+                    source_site=source_site,
+                    target_site=target_site,
+                    scope=scope,
+                    source_page=source_page,
+                    target_page=target_page,
+                ):
+                    continue
 
                 seen.add(dedupe_key)
                 score = int(
@@ -1620,6 +1683,19 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
 
     targets = _select_target_candidates(organic_keywords, site_name=site_name)
     donors = _select_source_candidates(top_pages, min_traffic=500)
+    if site_name == "BusinessABC":
+        pre_target_count = len(targets)
+        pre_donor_count = len(donors)
+        targets = [target for target in targets if "/wiki/" not in (target.get("target_page") or "").lower()]
+        donors = [donor for donor in donors if "/wiki/" not in (donor.get("source_page") or "").lower()]
+        logger.info(
+            "  internal_linking[%s]: applied wiki exclusion (targets %d -> %d, donors %d -> %d)",
+            site_name,
+            pre_target_count,
+            len(targets),
+            pre_donor_count,
+            len(donors),
+        )
     if not targets or not donors:
         logger.info(
             "  internal_linking[%s]: no eligible suggestions input (targets=%d, donors=%d, organic_keywords=%d, top_pages=%d, internal_links=%d)",

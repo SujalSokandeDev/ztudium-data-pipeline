@@ -992,9 +992,13 @@ def _layer1_generate_internal_links(
             f"The donor pages are from {source_site} and the target page is on {target_site}. "
             "For cross-platform suggestions, the donor and target are on different sites — respect what each site is about and who it serves. "
             "You will be given full enriched context for one target page and candidate donor pages. "
-            "Use the site niche, audience, page title, meta description, content summary, top keywords, traffic, and section context. "
+            "Use the site niche, audience, page title, meta description, content summary, top keywords, traffic, and section context as your starting point. "
+            "Also use your world knowledge about the companies, brands, people, products, and topics involved to judge whether a genuine editorial connection exists. "
+            "If your world knowledge tells you the donor and target are not truly related, do not suggest the link even if there is superficial keyword or URL overlap. "
+            "If the page data is thin, use your world knowledge to fill the topic context, but do not invent relationships that are not real. "
             "Only suggest links that are editorially useful for a real reader. "
-            "Do not guess what pages are about. Use only the evidence provided. "
+            "It is completely acceptable, and preferred, to return zero suggestions when no genuine connection exists. "
+            "Do not force connections just to fill a quota. "
             "For every suggestion, write a strong detailed reason. "
             "Sentence one must state the exact topical connection between the donor page and the target page. "
             "Then write two or three more sentences explaining why a real reader on the donor page would benefit from clicking through, "
@@ -1036,6 +1040,9 @@ def _layer2_validate_internal_links_batch(
         system_prompt=(
             f"You are a skeptical SEO reviewer validating internal linking suggestions for the {source_site} website. "
             "Reject anything where the connection is only the same broad category, same industry, or same vague theme. "
+            "Use your world knowledge about the companies, brands, people, and topics involved as an active fact-checking tool. "
+            "If the suggested reason contains speculation, assumption, or any claim that cannot be verified from the page data plus your world knowledge, reject it immediately. "
+            "If the suggested connection is factually wrong based on what you know about the real world, reject it immediately. "
             "Approve only if there is a clear, specific, editorial reason a reader would benefit from following the link from this donor page to this target page. "
             "Ask yourself: would a senior editor at a real publication approve this link? "
             "If the answer is anything other than a clear yes, reject it. "
@@ -1070,6 +1077,8 @@ def _layer2_validate_internal_links_batch(
                 "rejection_rule": (
                     "Reject if the only connection is that both pages are in the same industry, "
                     "same broad topic, or same general theme. "
+                    "Reject immediately if the reason relies on speculation, assumption, invented ownership, "
+                    "invented product relationships, or any fact claim not supported by the page data or your world knowledge. "
                     "A valid approval requires a specific, clear reason why a real reader "
                     "on the donor page would benefit from clicking through to the target page. "
                     "If you cannot state that specific reason, reject it."
@@ -1556,10 +1565,27 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
     top_pages = site_data.get("top_pages")
     internal_links = site_data.get("internal_links")
     if not organic_keywords or not top_pages or not internal_links:
+        logger.info(
+            "  internal_linking[%s]: skipped (organic_keywords=%s, top_pages=%s, internal_links=%s)",
+            site_name,
+            bool(organic_keywords),
+            bool(top_pages),
+            bool(internal_links),
+        )
         return []
 
     targets = _select_target_candidates(organic_keywords)
     donors = _select_source_candidates(top_pages, min_traffic=500)
+    if not targets or not donors:
+        logger.info(
+            "  internal_linking[%s]: no eligible suggestions input (targets=%d, donors=%d, organic_keywords=%d, top_pages=%d, internal_links=%d)",
+            site_name,
+            len(targets),
+            len(donors),
+            len((organic_keywords or {}).get("keywords", [])),
+            len((top_pages or {}).get("pages", [])),
+            len((internal_links or {}).get("internal_links", [])),
+        )
     existing_pairs = _build_existing_link_pairs(internal_links)
     page_map = _build_page_enrichment(site_name, site_data)
     return _generate_ai_suggestions_for_scope(
@@ -1586,6 +1612,14 @@ def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source
         targets = _select_target_candidates(organic_keywords)
         donors = _select_source_candidates(top_pages, min_traffic=500)
         if not targets or not donors:
+            logger.info(
+                "  internal_linking[cross_platform][%s]: excluded from source/target pool (targets=%d, donors=%d, organic_keywords=%d, top_pages=%d)",
+                site_name,
+                len(targets),
+                len(donors),
+                len((organic_keywords or {}).get("keywords", [])),
+                len((top_pages or {}).get("pages", [])),
+            )
             continue
         site_inputs[site_name] = {
             "targets": targets,

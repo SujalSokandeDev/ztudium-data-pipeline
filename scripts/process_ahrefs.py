@@ -58,7 +58,10 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 INTERNAL_LINKING_MODEL = "gpt-4o"
+INTERNAL_LINKING_BYPASS_LAYER2 = os.getenv("INTERNAL_LINKING_BYPASS_LAYER2", "").strip().lower() in {"1", "true", "yes"}
+INTERNAL_LINKING_DEBUG_PAYLOAD = os.getenv("INTERNAL_LINKING_DEBUG_PAYLOAD", "").strip().lower() in {"1", "true", "yes"}
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
+_layer1_debug_logged = False
 
 SITE_CONTEXT = {
     site["name"]: {
@@ -936,6 +939,28 @@ def _build_donor_payload(donor: dict, page_map: dict[str, dict], source_site: st
     }
 
 
+def _log_layer1_payload_once(source_site: str, target_site: str, target_payload: dict, donor_payloads: list[dict], scope: str) -> None:
+    global _layer1_debug_logged
+    if not INTERNAL_LINKING_DEBUG_PAYLOAD or _layer1_debug_logged:
+        return
+
+    sample_payload = {
+        "scope": scope,
+        "source_site": source_site,
+        "target_site": target_site,
+        "target_page": target_payload,
+        "candidate_donor_pages": donor_payloads,
+    }
+    logger.info(
+        "LAYER1 DEBUG PAYLOAD [%s] %s -> %s:\n%s",
+        scope,
+        source_site,
+        target_site,
+        json.dumps(sample_payload, ensure_ascii=False, indent=2),
+    )
+    _layer1_debug_logged = True
+
+
 def _layer1_generate_internal_links(
     source_site: str,
     target_site: str,
@@ -943,6 +968,24 @@ def _layer1_generate_internal_links(
     donor_payloads: list[dict],
     scope: str,
 ) -> list[dict]:
+    payload = {
+        "scope": scope,
+        "source_site": source_site,
+        "target_site": target_site,
+        "target_page": target_payload,
+        "candidate_donor_pages": donor_payloads,
+        "instructions": {
+            "max_suggestions": min(15, len(donor_payloads)),
+            "confidence_scale": "0-100 integer",
+            "anchor_rule": "Anchor text must be natural, descriptive, and fit the donor page context.",
+            "reason_rule": (
+                "Reason must be 3 to 4 sentences. Sentence 1 = exact topical connection. "
+                "Sentences 2 to 4 = concrete reader benefit, content/keyword overlap, and editorial justification."
+            ),
+            "site_rule": "Respect what the source site and target site are about and who they serve.",
+        },
+    }
+    _log_layer1_payload_once(source_site, target_site, target_payload, donor_payloads, scope)
     result = _openai_json_response(
         system_prompt=(
             "You are an internal linking strategist. "
@@ -961,23 +1004,7 @@ def _layer1_generate_internal_links(
             "Return JSON with a `suggestions` array only. "
             "Each suggestion must include: source_page, anchor_text, reason, confidence."
         ),
-        payload={
-            "scope": scope,
-            "source_site": source_site,
-            "target_site": target_site,
-            "target_page": target_payload,
-            "candidate_donor_pages": donor_payloads,
-            "instructions": {
-                "max_suggestions": min(15, len(donor_payloads)),
-                "confidence_scale": "0-100 integer",
-                "anchor_rule": "Anchor text must be natural, descriptive, and fit the donor page context.",
-                "reason_rule": (
-                    "Reason must be 3 to 4 sentences. Sentence 1 = exact topical connection. "
-                    "Sentences 2 to 4 = concrete reader benefit, content/keyword overlap, and editorial justification."
-                ),
-                "site_rule": "Respect what the source site and target site are about and who they serve.",
-            },
-        },
+        payload=payload,
     )
     suggestions = result.get("suggestions") or []
     return suggestions if isinstance(suggestions, list) else []
@@ -1010,8 +1037,12 @@ def _layer2_validate_internal_links_batch(
             f"You are a skeptical SEO reviewer validating internal linking suggestions for the {source_site} website. "
             "Reject anything where the connection is only the same broad category, same industry, or same vague theme. "
             "Approve only if there is a clear, specific, editorial reason a reader would benefit from following the link from this donor page to this target page. "
+            "Ask yourself: would a senior editor at a real publication approve this link? "
+            "If the answer is anything other than a clear yes, reject it. "
             "Only approve if confidence is 75 or above. If your confidence is below 75, reject the suggestion. "
             "If the anchor feels generic, forced, or weak, reject it. "
+            "For cross-platform suggestions, if there is a clear shared audience or clear topic overlap across Ztudium ecosystem sites, "
+            "that can be enough to approve even when the sites serve different verticals, but the editorial fit still has to be real. "
             "For approved suggestions, the reason must be a strong 3 to 4 sentence explanation. "
             "Sentence one must state the exact topical connection. "
             "The remaining sentences must explain the concrete reader benefit, the exact keyword or content overlap, "
@@ -1049,6 +1080,62 @@ def _layer2_validate_internal_links_batch(
     )
     results = result.get("results") or []
     return results if isinstance(results, list) else []
+
+
+def _save_layer1_candidates_direct(
+    *,
+    source_site: str,
+    target_site: str,
+    target: dict,
+    target_page: str,
+    donor_rows: dict[str, dict],
+    layer1_suggestions: list[dict],
+    scope: str,
+    seen: set,
+    suggestions: list[dict],
+) -> int:
+    saved = 0
+    for candidate in layer1_suggestions:
+        source_page = _normalize_url(candidate.get("source_page", ""))
+        donor_row = donor_rows.get(source_page)
+        if not donor_row:
+            continue
+
+        dedupe_key = (scope, source_site, source_page, target_site, target_page, target["target_page_keyword"])
+        if dedupe_key in seen:
+            continue
+
+        final_reason = (candidate.get("reason") or "").strip()
+        final_anchor = (candidate.get("anchor_text") or target["target_page_keyword"]).strip()
+        if not final_reason or not final_anchor:
+            continue
+
+        seen.add(dedupe_key)
+        score = int(
+            (donor_row["source_page_traffic"] / 100)
+            + (100 - target["target_page_position"])
+            + (target["target_page_volume"] / 1000)
+        )
+        suggestions.append({
+            "website": source_site,
+            "source_website": source_site,
+            "target_website": target_site,
+            "suggestion_scope": scope,
+            "source_page": source_page,
+            "source_page_traffic": donor_row["source_page_traffic"],
+            "target_page": target_page,
+            "target_page_keyword": target["target_page_keyword"],
+            "target_page_position": target["target_page_position"],
+            "target_page_volume": target["target_page_volume"],
+            "suggested_anchor": final_anchor,
+            "existing_link": False,
+            "score": score,
+            "status": "pending",
+            "reason": final_reason,
+            "ai_confidence": _coerce_confidence(candidate.get("confidence")),
+        })
+        saved += 1
+    return saved
 
 
 def _build_rule_based_suggestions(
@@ -1142,6 +1229,8 @@ def _generate_ai_suggestions_for_scope(
         len(targets),
         len(donors),
     )
+    if INTERNAL_LINKING_BYPASS_LAYER2:
+        logger.info("  internal_linking[%s]: layer2 bypass enabled, saving raw layer1 output", scope)
     suggestions = []
     seen = set()
     minimum_scope_suggestions = min(4, limit)
@@ -1199,6 +1288,25 @@ def _generate_ai_suggestions_for_scope(
             len(layer1_suggestions),
             target_page,
         )
+
+        if INTERNAL_LINKING_BYPASS_LAYER2:
+            saved_from_layer1 = _save_layer1_candidates_direct(
+                source_site=source_site,
+                target_site=target_site,
+                target=target,
+                target_page=target_page,
+                donor_rows=donor_rows,
+                layer1_suggestions=layer1_suggestions,
+                scope=scope,
+                seen=seen,
+                suggestions=suggestions,
+            )
+            logger.info(
+                "      layer2 bypass active: saved %d layer1 suggestions for %s",
+                saved_from_layer1,
+                target_page,
+            )
+            continue
 
         approved_for_target = 0
         try:
@@ -1345,6 +1453,25 @@ def _generate_ai_suggestions_for_scope(
                     target_site,
                     target_page,
                     str(exc)[:160],
+                )
+                continue
+
+            if INTERNAL_LINKING_BYPASS_LAYER2:
+                saved_from_layer1 = _save_layer1_candidates_direct(
+                    source_site=source_site,
+                    target_site=target_site,
+                    target=target,
+                    target_page=target_page,
+                    donor_rows=donor_rows,
+                    layer1_suggestions=layer1_suggestions,
+                    scope=scope,
+                    seen=seen,
+                    suggestions=suggestions,
+                )
+                logger.info(
+                    "      [fallback] layer2 bypass active: saved %d layer1 suggestions for %s",
+                    saved_from_layer1,
+                    target_page,
                 )
                 continue
 

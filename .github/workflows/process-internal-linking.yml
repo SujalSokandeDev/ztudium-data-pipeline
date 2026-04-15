@@ -42,4 +42,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          INTERNAL_LINKING_BYPASS_LAYER2: "1"
+          INTERNAL_LINKING_DEBUG_PAYLOAD: "1"
         run: python scripts/process_ahrefs.py --date-folder ${{ steps.date.outputs.folder }} --internal-linking-only

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import io
 import logging
 import os
@@ -86,6 +87,10 @@ EXCLUDE_TERMS = (
     "roblox",
     "minecraft",
 )
+
+RAW_URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
+HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
+ALLOWED_KEYWORD_RE = re.compile(r"^[A-Za-z0-9\s&'\".,:;!?()\/+\-_%#@$\[\]]+$")
 
 INTENT_SIGNALS = {
     "informational": {
@@ -256,6 +261,35 @@ def _calc_opportunity_score(volume: int, kd: float, comp_count: int) -> float:
     return round((vol_norm * 50) + (kd_norm * 30) + (coverage * 20), 1)
 
 
+def _keyword_filter_reason(keyword: str) -> str | None:
+    text = html.unescape((keyword or "").strip())
+    if not text:
+        return "empty"
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 3:
+        return "too_short"
+    if RAW_URL_RE.search(text):
+        return "raw_url"
+    if HTML_ENTITY_RE.search(keyword or ""):
+        return "html_entity"
+    if not ALLOWED_KEYWORD_RE.fullmatch(text):
+        return "non_latin_or_uncommon_chars"
+
+    non_space = len(compact)
+    letter_count = len(re.findall(r"[A-Za-z]", text))
+    if non_space and (letter_count / non_space) < 0.5:
+        return "low_letter_ratio"
+
+    punctuation_count = len(re.findall(r"[^A-Za-z0-9\s]", text))
+    if non_space and (punctuation_count / non_space) > 0.35:
+        return "excessive_special_chars"
+
+    if re.search(r"([A-Za-z])\1{3,}", text):
+        return "repeated_characters"
+
+    return None
+
+
 def _detect_clusters(rows: list[dict], top_n: int = 12) -> dict[str, str]:
     words = Counter()
     for row in rows:
@@ -305,17 +339,17 @@ def _detect_competitor_domains(headers: list[str], our_domain: str | None) -> li
     return domains
 
 
-def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict]]:
+def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict], Counter]:
     filename = os.path.basename(filepath)
     website = detect_website(filename)
     if not website:
         logger.warning("Skipping file (website not detected): %s", filename)
-        return None, []
+        return None, [], Counter()
 
     rows = _read_csv_rows(filepath)
     if not rows:
         logger.warning("Skipping unreadable or empty CSV: %s", filename)
-        return website, []
+        return website, [], Counter()
 
     headers = list(rows[0].keys())
     domain_match = re.match(r"(?:www\.)?([a-z0-9-]+\.(?:com|net|org|ai|io))", filename.lower())
@@ -324,11 +358,18 @@ def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict]]:
     snapshot_date = extract_snapshot_date(filename)
 
     parsed = []
+    filtered_counts: Counter[str] = Counter()
     for row in rows:
         keyword = (row.get("Keyword") or row.get("keyword") or "").strip()
         if not keyword:
             continue
         if any(term in keyword.lower() for term in EXCLUDE_TERMS):
+            filtered_counts["excluded_term"] += 1
+            continue
+
+        noise_reason = _keyword_filter_reason(keyword)
+        if noise_reason:
+            filtered_counts[noise_reason] += 1
             continue
 
         volume = _as_int(row.get("Volume"), 0)
@@ -377,14 +418,21 @@ def parse_keyword_gap_file(filepath: str) -> tuple[str | None, list[dict]]:
         row["cluster"] = cluster_map.get(row["keyword"], "Other")
 
     logger.info(
-        "Parsed %s -> website=%s rows=%d competitors=%d snapshot=%s",
+        "Parsed %s -> website=%s rows=%d filtered=%d competitors=%d snapshot=%s",
         filename,
         website,
         len(parsed),
+        sum(filtered_counts.values()),
         len(competitors),
         snapshot_date,
     )
-    return website, parsed
+    if filtered_counts:
+        logger.info(
+            "Filtered %s keyword rows: %s",
+            filename,
+            ", ".join(f"{reason}={count}" for reason, count in sorted(filtered_counts.items())),
+        )
+    return website, parsed, filtered_counts
 
 
 def dedupe_rows(rows: list[dict]) -> list[dict]:
@@ -603,12 +651,14 @@ def main():
     all_rows = []
     website_errors = {}
     website_seen = set()
+    total_filtered_counts: Counter[str] = Counter()
     for filepath in sorted(files):
         try:
-            website, rows = parse_keyword_gap_file(filepath)
+            website, rows, filtered_counts = parse_keyword_gap_file(filepath)
             if website:
                 website_seen.add(website)
             all_rows.extend(rows)
+            total_filtered_counts.update(filtered_counts)
         except Exception as exc:
             name = os.path.basename(filepath)
             website_errors[name] = str(exc)
@@ -619,6 +669,12 @@ def main():
 
     deduped_rows = dedupe_rows(all_rows)
     logger.info("Rows: parsed=%d deduped=%d", len(all_rows), len(deduped_rows))
+    if total_filtered_counts:
+        logger.info(
+            "Keyword noise filter removed %d rows total: %s",
+            sum(total_filtered_counts.values()),
+            ", ".join(f"{reason}={count}" for reason, count in sorted(total_filtered_counts.items())),
+        )
 
     from supabase import create_client
 

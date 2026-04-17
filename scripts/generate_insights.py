@@ -9,6 +9,7 @@ Run after compute_trends.py: python scripts/generate_insights.py
 import os
 import sys
 import json
+import re
 import logging
 import time
 import threading
@@ -990,6 +991,7 @@ def generate_content_plan(context):
                 model="gpt-4o",
                 temperature=0.4,
                 max_tokens=16000,
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": CLUSTER_PROMPT},
                     {"role": "user", "content": (
@@ -1008,11 +1010,17 @@ def generate_content_plan(context):
         raw = raw.strip()
         if raw.startswith("json"):
             raw = raw[4:].strip()
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        if match:
+            raw = match.group(0)
 
         plan = json.loads(raw)
 
     except json.JSONDecodeError as e:
+        raw_preview = (raw[:600] + "...") if "raw" in locals() and len(raw) > 600 else locals().get("raw", "")
         logger.error(f"  Failed to parse cluster plan: {e}")
+        if raw_preview:
+            logger.error(f"  Raw cluster response preview: {raw_preview}")
         return None
     except Exception as e:
         logger.error(f"  Clustering call failed: {e}")
@@ -1102,6 +1110,8 @@ def generate_content_plan(context):
         for c in s.get("clusters", [])
     )
     logger.info(f"  Validated: {len(validated_sites)} sites, {total_clusters} clusters, {total_kws} keywords ({total_relaxed} under relaxed thresholds)")
+    if not validated_sites:
+        logger.warning("  Clustering produced no validated site clusters after post-validation")
 
     return plan if validated_sites else None
 

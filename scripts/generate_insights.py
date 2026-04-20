@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import re
+import html
 import logging
 import time
 import threading
@@ -791,19 +792,111 @@ CORE_TOPIC_STRIP = {
 # Question prefixes for identifying question-format keywords
 QUESTION_PREFIXES = ("how ", "what ", "why ", "is ", "does ", "can ", "do ", "are ", "which ", "where ", "when ", "should ")
 
+RAW_URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
+HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
+ALLOWED_KEYWORD_RE = re.compile(r"^[A-Za-z0-9\s&'\".,:;!?()/+\-_%#@$\[\]]+$")
+ALLOWED_LABEL_RE = re.compile(r"^[A-Za-z0-9\s&'\".,:;!?()/+\-_%#@$\[\]]+$")
+CONTROL_CHAR_RE = re.compile(r"[\u0000-\u001F\u007F-\u009F\uFFFD]")
+
+
+def clean_text(value: str | None) -> str:
+    """Normalize whitespace, entities, and control characters."""
+    return re.sub(r"\s+", " ", CONTROL_CHAR_RE.sub(" ", html.unescape(str(value or "")))).strip()
+
+
+def keyword_filter_reason(keyword: str | None) -> str | None:
+    """Reject non-Latin and noisy keywords before they reach clustering."""
+    text = clean_text(keyword)
+    if not text:
+        return "empty"
+
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 3:
+        return "too_short"
+    if RAW_URL_RE.search(text):
+        return "raw_url"
+    if HTML_ENTITY_RE.search(text):
+        return "html_entity"
+    if not ALLOWED_KEYWORD_RE.fullmatch(text):
+        return "non_latin_or_uncommon_chars"
+
+    letter_count = len(re.findall(r"[A-Za-z]", text))
+    if compact and (letter_count / len(compact)) < 0.5:
+        return "low_letter_ratio"
+
+    punctuation_count = len(re.findall(r"[^A-Za-z0-9\s]", text))
+    if compact and (punctuation_count / len(compact)) > 0.35:
+        return "excessive_special_chars"
+
+    if re.search(r"([A-Za-z])\1{3,}", text):
+        return "repeated_characters"
+
+    return None
+
+
+def is_valid_keyword(keyword: str | None) -> bool:
+    return keyword_filter_reason(keyword) is None
+
+
+def sanitize_keyword_record(row: dict) -> dict | None:
+    """Return a clean keyword row or None if it should be excluded."""
+    keyword = clean_text(row.get("keyword"))
+    if not is_valid_keyword(keyword):
+        return None
+
+    cluster_label = clean_text(row.get("cluster"))
+    if cluster_label and not ALLOWED_LABEL_RE.fullmatch(cluster_label):
+        cluster_label = ""
+
+    return {
+        **row,
+        "website": clean_text(row.get("website")),
+        "keyword": keyword,
+        "intent": clean_text(row.get("intent")) or "other",
+        "cluster": cluster_label or None,
+    }
+
+
+def sanitize_cluster_label(label: str | None, primary_keyword: str, fallback: str | None = None) -> str:
+    """Ensure cluster labels never contain invalid character noise."""
+    text = clean_text(label)
+    if text and ALLOWED_LABEL_RE.fullmatch(text):
+        return text
+
+    derived = clean_text(fallback) or extract_core_topic(primary_keyword).title() or primary_keyword.title()
+    return derived if ALLOWED_LABEL_RE.fullmatch(derived) else primary_keyword.title()
+
+
+def sanitize_hub_title(title: str | None, primary_keyword: str, cluster_topic: str) -> str:
+    """Ensure stored hub titles are readable and Latin-only."""
+    text = clean_text(title)
+    if text and ALLOWED_LABEL_RE.fullmatch(text):
+        return text
+    fallback = f"{cluster_topic}: {primary_keyword.title()}"
+    return fallback if ALLOWED_LABEL_RE.fullmatch(fallback) else primary_keyword.title()
+
+
+def sanitize_narrative(text: str | None, fallback: str) -> str:
+    """Keep freeform text readable while preventing non-Latin noise from being stored."""
+    cleaned = clean_text(text)
+    return cleaned if cleaned and ALLOWED_LABEL_RE.fullmatch(cleaned) else fallback
+
 
 def extract_core_topic(longtail_keyword: str) -> str:
     """Extract the core head term from a longtail keyword by stripping qualifiers."""
-    words = longtail_keyword.lower().strip().split()
+    cleaned = clean_text(longtail_keyword).lower()
+    words = cleaned.split()
     core = [w for w in words if w not in CORE_TOPIC_STRIP and not w.isdigit()]
-    return " ".join(core) if core else longtail_keyword.lower().strip()
+    return " ".join(core) if core else cleaned
 
 
 def find_question_keyword(keywords: list) -> str | None:
     """Find the best question-format keyword from a list of keyword dicts."""
     candidates = []
     for kw in keywords:
-        kw_str = kw.get("keyword", "").strip().lower()
+        kw_str = clean_text(kw.get("keyword")).lower()
+        if not is_valid_keyword(kw_str):
+            continue
         if any(kw_str.startswith(prefix) for prefix in QUESTION_PREFIXES):
             # Score by volume (prefer high volume question keywords)
             candidates.append((kw_str, kw.get("volume", 0)))
@@ -839,6 +932,8 @@ STRICT RULES:
 4. Hub article title must be optimized to target the ENTIRE cluster, not just the primary keyword
 5. Never use generic titles like "Ultimate Guide to X" — be specific, compelling, and SEO-optimized
 6. Estimate traffic realistically: assume 15-25% CTR for position 1-3 on total cluster volume
+7. DO NOT use non-Latin characters anywhere in cluster topics, titles, or keywords
+8. If a keyword contains Chinese, Cyrillic, Arabic, or other non-Latin characters, discard it instead of using it
 
 RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 
@@ -883,7 +978,7 @@ def generate_content_plan(context):
     """Generate topic-based keyword clusters for content briefs."""
 
     # ── Step 1: Pull ALL content gap keywords (wider net to cover all 9 sites) ──
-    all_kw_data = safe_query(
+    raw_kw_data = safe_query(
         "content_gap_keywords",
         "website, keyword, volume, kd, opportunity_score, intent, cluster, competitors",
         order=("volume", True),
@@ -891,8 +986,32 @@ def generate_content_plan(context):
         label="all_content_gap_for_clustering"
     )
 
-    if not all_kw_data:
+    if not raw_kw_data:
         logger.info("  No content_gap_keywords data available, skipping clustering")
+        return None
+
+    all_kw_data = []
+    invalid_reason_counts = defaultdict(int)
+    seen_keyword_keys = set()
+    for raw_kw in raw_kw_data:
+        sanitized = sanitize_keyword_record(raw_kw)
+        if not sanitized:
+            invalid_reason_counts[keyword_filter_reason(raw_kw.get("keyword")) or "invalid"] += 1
+            continue
+        dedupe_key = f"{sanitized.get('website')}|{sanitized.get('keyword').lower()}"
+        if dedupe_key in seen_keyword_keys:
+            continue
+        seen_keyword_keys.add(dedupe_key)
+        all_kw_data.append(sanitized)
+
+    if invalid_reason_counts:
+        logger.info(
+            "  Filtered invalid clustering keywords: %s",
+            ", ".join(f"{reason}={count}" for reason, count in sorted(invalid_reason_counts.items()))
+        )
+
+    if not all_kw_data:
+        logger.info("  No valid Latin-only content gap keywords available after filtering, skipping clustering")
         return None
 
     # ── Step 2: Pre-filter — two tiers for progressive threshold relaxation ──
@@ -1033,9 +1152,18 @@ def generate_content_plan(context):
         for cluster in site_data.get("clusters", []):
             # Validate primary keyword
             pk = cluster.get("primary_keyword", {})
-            pk_key = pk.get("keyword", "").strip().lower()
+            pk_raw = clean_text(pk.get("keyword"))
+            if not is_valid_keyword(pk_raw):
+                logger.warning(
+                    "    Skipping cluster '%s' - primary keyword failed Latin/noise validation: '%s'",
+                    clean_text(cluster.get("cluster_topic")) or "?",
+                    pk_raw,
+                )
+                continue
+            pk_key = pk_raw.lower()
             if pk_key in kw_lookup:
                 real = kw_lookup[pk_key]
+                pk["keyword"] = real["keyword"]
                 pk["volume"] = real["volume"]
                 pk["kd"] = real["kd"]
                 pk["intent"] = real["intent"]
@@ -1051,9 +1179,14 @@ def generate_content_plan(context):
             # Validate related keywords
             valid_related = []
             for rk in cluster.get("related_keywords", []):
-                rk_key = rk.get("keyword", "").strip().lower()
+                rk_raw = clean_text(rk.get("keyword"))
+                if not is_valid_keyword(rk_raw):
+                    logger.warning("    Stripped invalid related keyword: '%s'", rk_raw)
+                    continue
+                rk_key = rk_raw.lower()
                 if rk_key in kw_lookup:
                     real = kw_lookup[rk_key]
+                    rk["keyword"] = real["keyword"]
                     rk["volume"] = real["volume"]
                     rk["kd"] = real["kd"]
                     rk["intent"] = real["intent"]
@@ -1072,13 +1205,39 @@ def generate_content_plan(context):
             cluster["related_keywords"] = valid_related
 
             # Extract core topic from primary keyword
-            cluster["core_topic"] = extract_core_topic(pk.get("keyword", ""))
+            cluster["core_topic"] = sanitize_cluster_label(
+                cluster.get("core_topic"),
+                pk.get("keyword", ""),
+                extract_core_topic(pk.get("keyword", "")),
+            )
+
+            # Ensure cluster labels and titles stay clean even if the model returned noise.
+            cluster["cluster_topic"] = sanitize_cluster_label(
+                cluster.get("cluster_topic"),
+                pk.get("keyword", ""),
+                cluster["core_topic"],
+            )
+            cluster["hub_article_title"] = sanitize_hub_title(
+                cluster.get("hub_article_title"),
+                pk.get("keyword", ""),
+                cluster["cluster_topic"],
+            )
+            cluster["strategy"] = sanitize_narrative(
+                cluster.get("strategy"),
+                f"Build content around {cluster['cluster_topic']} using validated high-opportunity keywords only.",
+            )
+            site_data["summary"] = sanitize_narrative(
+                site_data.get("summary"),
+                f"Focus {site_data.get('website', 'this site')} on validated Latin-only content clusters with real ranking opportunity.",
+            )
 
             # Find question-format keyword in the cluster
             all_cluster_kws = [pk] + valid_related
             q_kw = find_question_keyword(all_cluster_kws)
             if q_kw:
                 cluster["question_keyword"] = q_kw
+            elif "question_keyword" in cluster:
+                cluster.pop("question_keyword", None)
 
             # Recalculate totals from validated data
             all_vols = [pk.get("volume", 0)] + [r.get("volume", 0) for r in valid_related]

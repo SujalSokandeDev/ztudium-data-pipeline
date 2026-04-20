@@ -19,6 +19,11 @@ Canonical SQL migrations live in [`database/migrations`](database/migrations):
 3. `003_content_gap.sql`
 4. `004_indexes_and_constraints.sql`
 5. `005_rls_policies.sql`
+6. `006_lost_backlinks.sql`
+7. `007_internal_linking_suggestions.sql`
+8. `008_backlink_validation.sql`
+9. `009_internal_linking_ai_fields.sql`
+10. `010_daily_content_opportunities.sql`
 
 Helpers:
 
@@ -47,6 +52,9 @@ Local `.env` and/or GitHub Actions secrets:
 - `KEYWORD_GAP_STORAGE_BUCKET` (optional, default: `keyword_gap`)
 - `GSC_PROPERTY_*` for all websites
 - `GA4_PROPERTY_*` for all websites
+- `OPENAI_API_KEY` for AI insights and daily content opportunity generation
+- `ARVOW_API_KEY` for storing Arvow-ready payloads
+- `ARVOW_INTEGRATION_ID_*` for websites that already have Arvow integrations
 
 ## Workflows
 
@@ -55,6 +63,7 @@ Local `.env` and/or GitHub Actions secrets:
 - Workflow: `.github/workflows/daily-google-fetch.yml`
 - Timeout: 15 minutes
 - Writes: `daily_metrics`, `website_keywords`, `website_pages`
+- Follow-up steps: `compute_trends.py`, `generate_insights.py`, `generate_daily_content_opportunities.py`
 
 ### Ahrefs Processing
 
@@ -69,6 +78,29 @@ Local `.env` and/or GitHub Actions secrets:
 - Storage bucket: `keyword_gap`
 - Writes: `content_gap_keywords`
 - Deduplication: upsert conflict key is `(date, website, keyword)` and parser dedupes duplicate keys before insert
+- Follow-up steps: `generate_insights.py`, `generate_daily_content_opportunities.py`
+
+### Daily Content Opportunities
+
+- Workflow: `.github/workflows/daily-content-opportunities.yml`
+- Script: `scripts/generate_daily_content_opportunities.py`
+- Writes: `daily_content_opportunities`
+- Moves completed or ignored queue items to: `content_generation_history`
+- Output: 5-6 content creation opportunities per site with stored `arvow_payload`
+- Controls:
+  - dedupes against similar title/keyword combinations from the previous 7 days
+  - keeps active queue focused on content only
+  - filters invalid characters and noisy keywords before AI processing
+- Triggers:
+  - daily schedule
+  - manual workflow dispatch
+  - automatic rerun after `Daily Google Fetch (GSC + GA4)`, `Process Ahrefs CSVs`, and `Process Keyword Gap CSVs`
+
+### Manual Smoke Test
+
+```bash
+python scripts/generate_daily_content_opportunities.py --use-sample-data --dry-run --site FreedomX
+```
 
 ### Local Keyword Gap Upload
 

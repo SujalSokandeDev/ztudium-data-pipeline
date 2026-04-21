@@ -1,0 +1,52 @@
+name: Arvow Verification Followup
+
+on:
+  schedule:
+    - cron: "30 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-pending-arvow-publishes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          python - <<'PY'
+          import os, sys
+          required = [
+              "SUPABASE_URL",
+              "SUPABASE_SERVICE_KEY",
+              "ARVOW_API_KEY",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              print("Missing required secrets:", ", ".join(missing))
+              sys.exit(1)
+          print("All required secrets are present.")
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify pending Arvow publishes and sync clusters
+        run: python scripts/verify_arvow_publish.py
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ARVOW_API_KEY: ${{ secrets.ARVOW_API_KEY }}
+      ARVOW_VERIFY_MIN_DELAY_MINUTES: "45"
+      ARVOW_VERIFY_MAX_ATTEMPTS: "4"
+      ARVOW_VERIFY_ATTEMPT_WINDOWS: "45,90,180,360"

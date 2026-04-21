@@ -12,3 +12,4 @@
 \i database/migrations/008_backlink_validation.sql
 \i database/migrations/009_internal_linking_ai_fields.sql
 \i database/migrations/010_daily_content_opportunities.sql
+\i database/migrations/011_arvow_automation_v3.sql

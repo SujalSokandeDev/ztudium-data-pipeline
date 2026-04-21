@@ -31,8 +31,11 @@ load_dotenv()
 try:
     from openai import OpenAI
     from supabase import create_client
+    from pytrends.request import TrendReq
 except ImportError as exc:  # pragma: no cover
-    raise RuntimeError(f"Missing dependency: {exc}") from exc
+    if "pytrends" not in str(exc):
+        raise RuntimeError(f"Missing dependency: {exc}") from exc
+    TrendReq = None  # type: ignore[assignment]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -67,6 +70,7 @@ ACTIVE_QUEUE_TARGET = 6
 RECENT_DEDUPE_DAYS = 7
 MIN_SIGNIFICANT_SCORE_DELTA = 12
 OPENAI_MODEL = "gpt-4o-mini"
+TREND_MAX_ADJUSTMENT = 5
 
 CONTROL_CHAR_RE = re.compile(r"[\u0000-\u001F\u007F-\u009F\uFFFD]")
 RAW_URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
@@ -106,19 +110,6 @@ STOP_WORDS = {
     "why",
     "vs",
 }
-SITE_DOMAINS = {
-    "CitiesABC": "citiesabc.com",
-    "BusinessABC": "businessabc.net",
-    "HedgeThink": "hedgethink.com",
-    "FashionABC": "fashionabc.org",
-    "TradersDNA": "tradersdna.com",
-    "FreedomX": "freedomx.com",
-    "Wisdomia": "wisdomia.ai",
-    "SportsDNA": "sportsdna.ai",
-    "IntelligentHQ": "intelligenthq.com",
-}
-
-
 def require_env(name: str, value: str) -> str:
     if not value:
         raise RuntimeError(f"{name} must be set")
@@ -222,14 +213,20 @@ def get_site_profile(site_name: str) -> dict[str, str]:
                 "slug": site["slug"],
                 "category": site["category"],
                 "audience": site["audience"],
-                "domain": SITE_DOMAINS.get(site["name"], ""),
+                "domain": clean_text(site.get("domain")),
+                "sitemap_url": clean_text(site.get("sitemap_url")),
+                "auto_publish_enabled": str(bool(site.get("auto_publish_enabled"))).lower(),
+                "daily_publish_limit": str(int(site.get("daily_publish_limit") or 0)),
             }
     return {
         "name": site_name,
         "slug": slugify(site_name),
         "category": "",
         "audience": "",
-        "domain": SITE_DOMAINS.get(site_name, ""),
+        "domain": "",
+        "sitemap_url": "",
+        "auto_publish_enabled": "false",
+        "daily_publish_limit": "0",
     }
 
 
@@ -237,6 +234,17 @@ def build_site_arvow_config(site_name: str) -> dict[str, Any]:
     profile = get_site_profile(site_name)
     integration_id = os.getenv(f"ARVOW_INTEGRATION_ID_{profile['slug'].upper()}", "")
     domain = profile["domain"]
+    sitemap_candidates: list[str] = []
+    for url in [
+        profile["sitemap_url"],
+        f"https://{domain}/sitemap_index.xml" if domain else "",
+        f"https://www.{domain}/sitemap_index.xml" if domain else "",
+        f"https://{domain}/wp-sitemap.xml" if domain else "",
+        f"https://www.{domain}/wp-sitemap.xml" if domain else "",
+    ]:
+        cleaned = clean_url(url)
+        if cleaned and cleaned not in sitemap_candidates:
+            sitemap_candidates.append(cleaned)
     external_sources = [
         f"https://{candidate['domain']}/"
         for candidate in (get_site_profile(site["name"]) for site in WEBSITES)
@@ -246,8 +254,10 @@ def build_site_arvow_config(site_name: str) -> dict[str, Any]:
         "site": site_name,
         "slug": profile["slug"],
         "domain": domain,
+        "auto_publish_enabled": profile["auto_publish_enabled"] == "true",
+        "daily_publish_limit": int(profile["daily_publish_limit"] or 0),
         "integration_id": integration_id or None,
-        "sitemaps": [f"https://{domain}/api/sitemaps/index.xml"] if domain else [],
+        "sitemaps": sitemap_candidates,
         "external_sources": external_sources,
         "youtube_links": ["https://www.youtube.com/@DinisGuarda"],
     }
@@ -437,6 +447,22 @@ def load_live_dataset(client) -> dict[str, Any]:
         order=("date", True),
         limit=2000,
     )
+    page_rows = safe_query(
+        client,
+        "website_pages",
+        "date, website, url, clicks, impressions, position, ga_sessions, source",
+        filters=[("gte", ("date", (date.today() - timedelta(days=30)).isoformat()))],
+        order=("date", True),
+        limit=6000,
+    )
+    keyword_rows = safe_query(
+        client,
+        "website_keywords",
+        "date, website, keyword, clicks, impressions, position, source",
+        filters=[("gte", ("date", (date.today() - timedelta(days=30)).isoformat()))],
+        order=("date", True),
+        limit=6000,
+    )
     active_rows = safe_query(
         client,
         "daily_content_opportunities",
@@ -444,12 +470,12 @@ def load_live_dataset(client) -> dict[str, Any]:
         order=("updated_at", True),
         limit=2000,
     )
-    history_rows = safe_query(
+    publish_history_rows = safe_query(
         client,
-        "content_generation_history",
+        "arvow_publish_history",
         "*",
-        filters=[("gte", ("generated_date", (date.today() - timedelta(days=RECENT_DEDUPE_DAYS)).isoformat()))],
-        order=("completed_at", True),
+        filters=[("gte", ("created_at", (datetime.now(timezone.utc) - timedelta(days=RECENT_DEDUPE_DAYS)).isoformat()))],
+        order=("created_at", True),
         limit=2000,
     )
 
@@ -461,8 +487,10 @@ def load_live_dataset(client) -> dict[str, Any]:
         "broken_rows": broken_rows,
         "lost_rows": lost_rows,
         "metric_rows": metric_rows,
+        "page_rows": page_rows,
+        "keyword_rows": keyword_rows,
         "active_rows": active_rows,
-        "history_rows": history_rows,
+        "publish_history_rows": publish_history_rows,
     }
 
 
@@ -556,8 +584,10 @@ def load_sample_dataset() -> dict[str, Any]:
                 "ga_bounce_rate": 41.2,
             }
         ],
+        "page_rows": [],
+        "keyword_rows": [],
         "active_rows": [],
-        "history_rows": [],
+        "publish_history_rows": [],
     }
 
 
@@ -604,6 +634,8 @@ def build_site_datasets(dataset: dict[str, Any], *, site_filter: str | None = No
 
         clusters = []
         for cluster in content_plan_by_site.get(site_name, []):
+            if clean_text(cluster.get("status")).lower() in {"covered", "done", "published"}:
+                continue
             primary = cluster.get("primary_keyword") or {}
             primary_keyword = clean_text(primary.get("keyword"))
             if primary_keyword and is_noise_keyword(primary_keyword):
@@ -689,6 +721,35 @@ def build_site_datasets(dataset: dict[str, Any], *, site_filter: str | None = No
         ]
         metrics.sort(key=lambda row: clean_text(row.get("date")), reverse=True)
 
+        page_rows = [
+            {
+                "url": clean_url(row.get("url")),
+                "date": clean_text(row.get("date")),
+                "clicks": int(row.get("clicks") or 0),
+                "impressions": int(row.get("impressions") or 0),
+                "position": row.get("position"),
+                "ga_sessions": int(row.get("ga_sessions") or 0),
+                "source": clean_text(row.get("source")) or "unknown",
+            }
+            for row in dataset.get("page_rows", [])
+            if clean_text(row.get("website")) == site_name
+        ]
+        page_rows.sort(key=lambda row: row["date"], reverse=True)
+
+        keyword_snapshots = [
+            {
+                "keyword": clean_text(row.get("keyword")),
+                "date": clean_text(row.get("date")),
+                "clicks": int(row.get("clicks") or 0),
+                "impressions": int(row.get("impressions") or 0),
+                "position": row.get("position"),
+                "source": clean_text(row.get("source")) or "unknown",
+            }
+            for row in dataset.get("keyword_rows", [])
+            if clean_text(row.get("website")) == site_name and not is_noise_keyword(clean_text(row.get("keyword")))
+        ]
+        keyword_snapshots.sort(key=lambda row: row["date"], reverse=True)
+
         site_insights = [
             insight
             for insight in dataset["insights"]
@@ -700,9 +761,9 @@ def build_site_datasets(dataset: dict[str, Any], *, site_filter: str | None = No
             for row in dataset["active_rows"]
             if clean_text(row.get("site")) == site_name
         ]
-        history_rows = [
+        publish_history_rows = [
             row
-            for row in dataset["history_rows"]
+            for row in dataset.get("publish_history_rows", [])
             if clean_text(row.get("site")) == site_name
         ]
 
@@ -717,9 +778,11 @@ def build_site_datasets(dataset: dict[str, Any], *, site_filter: str | None = No
                 "broken_backlinks": broken,
                 "lost_backlinks": lost,
                 "metrics": metrics,
+                "pages": page_rows,
+                "keyword_snapshots": keyword_snapshots,
                 "insights": site_insights,
                 "active_rows": active_rows,
-                "history_rows": history_rows,
+                "publish_history_rows": publish_history_rows,
             }
         )
 
@@ -777,6 +840,73 @@ def score_cluster_candidate(cluster: dict[str, Any]) -> int:
     return max(0, min(100, round(score)))
 
 
+def fetch_trend_adjustments(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    if TrendReq is None:
+        return {}
+
+    unique_keywords = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        keyword = clean_text(candidate.get("primary_keyword"))
+        key = normalize_key(keyword)
+        if not keyword or key in seen:
+            continue
+        seen.add(key)
+        unique_keywords.append(keyword)
+        if len(unique_keywords) >= 10:
+            break
+
+    if not unique_keywords:
+        return {}
+
+    adjustments: dict[str, dict[str, Any]] = {}
+    try:
+        client = TrendReq(hl="en-US", tz=330)
+        for start in range(0, len(unique_keywords), 5):
+            keywords = unique_keywords[start : start + 5]
+            client.build_payload(keywords, timeframe="today 3-m")
+            interest = client.interest_over_time()
+            if interest.empty:
+                continue
+            for keyword in keywords:
+                if keyword not in interest.columns:
+                    continue
+                series = interest[keyword].tolist()
+                if not series:
+                    continue
+                recent_window = series[-7:] or series
+                baseline_window = series[:-7] or series
+                recent_avg = sum(recent_window) / max(len(recent_window), 1)
+                baseline_avg = sum(baseline_window) / max(len(baseline_window), 1)
+                ratio = recent_avg / baseline_avg if baseline_avg > 0 else 1.0
+                adjustment = 0
+                label = "steady"
+                if ratio >= 1.35 and recent_avg >= 8:
+                    adjustment = TREND_MAX_ADJUSTMENT
+                    label = "rising_fast"
+                elif ratio >= 1.15 and recent_avg >= 6:
+                    adjustment = min(3, TREND_MAX_ADJUSTMENT)
+                    label = "rising"
+                elif ratio <= 0.55 and baseline_avg >= 8:
+                    adjustment = -TREND_MAX_ADJUSTMENT
+                    label = "stale"
+                elif ratio <= 0.75 and baseline_avg >= 6:
+                    adjustment = -3
+                    label = "cooling"
+                adjustments[normalize_key(keyword)] = {
+                    "adjustment": adjustment,
+                    "label": label,
+                    "recent_avg": round(recent_avg, 2),
+                    "baseline_avg": round(baseline_avg, 2),
+                    "ratio": round(ratio, 2),
+                }
+    except Exception as exc:
+        logger.warning("Trends lookup failed; continuing without pytrends signal: %s", exc)
+        return {}
+
+    return adjustments
+
+
 def build_prioritized_candidates(site_data: dict[str, Any]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_keywords: set[str] = set()
@@ -798,6 +928,8 @@ def build_prioritized_candidates(site_data: dict[str, Any]) -> list[dict[str, An
                 "priority_score": score_cluster_candidate(cluster),
                 "intent": clean_text(primary.get("intent")) or "informational",
                 "support_keywords": [item["keyword"] for item in cluster.get("related_keywords", [])[:4]],
+                "trend_adjustment": 0,
+                "trend_label": "steady",
             }
         )
 
@@ -816,7 +948,19 @@ def build_prioritized_candidates(site_data: dict[str, Any]) -> list[dict[str, An
                 "priority_score": score_keyword_candidate(keyword),
                 "intent": keyword.get("intent") or "informational",
                 "support_keywords": [],
+                "trend_adjustment": 0,
+                "trend_label": "steady",
             }
+        )
+
+    trend_adjustments = fetch_trend_adjustments(candidates)
+    for candidate in candidates:
+        trend_data = trend_adjustments.get(normalize_key(candidate["primary_keyword"])) or {}
+        candidate["trend_adjustment"] = int(trend_data.get("adjustment") or 0)
+        candidate["trend_label"] = clean_text(trend_data.get("label")) or "steady"
+        candidate["priority_score"] = max(
+            0,
+            min(100, int(candidate["priority_score"]) + int(trend_data.get("adjustment") or 0)),
         )
 
     candidates.sort(key=lambda row: row["priority_score"], reverse=True)
@@ -847,11 +991,19 @@ def recent_duplicate(existing_rows: list[dict[str, Any]], title: str, keyword: s
 
 def build_site_payload(site_data: dict[str, Any]) -> dict[str, Any]:
     performance = summarize_performance(site_data["metrics"])
+    existing_rows = site_data["active_rows"]
     support_signals = {
         "internal_link_count": len(site_data["internal_links"]),
         "top_internal_links": site_data["internal_links"][:3],
         "broken_backlinks": sorted(site_data["broken_backlinks"], key=lambda row: row["domain_rating"], reverse=True)[:3],
         "lost_backlinks": sorted(site_data["lost_backlinks"], key=lambda row: row["domain_rating"], reverse=True)[:3],
+        "recent_live_pages": site_data["pages"][:8],
+        "recent_live_keywords": site_data["keyword_snapshots"][:8],
+        "published_urls": [
+            clean_url(row.get("published_url"))
+            for row in site_data["publish_history_rows"]
+            if clean_url(row.get("published_url"))
+        ][:8],
     }
     return {
         "site": site_data["site"],
@@ -864,15 +1016,17 @@ def build_site_payload(site_data: dict[str, Any]) -> dict[str, Any]:
                 "primary_keyword": clean_text(row.get("primary_keyword")),
                 "status": clean_text(row.get("status")),
             }
-            for row in site_data["active_rows"]
+            for row in existing_rows
+            if clean_text(row.get("status")) not in {"published", "ignored", "verification_failed", "completed"}
         ],
         "recent_history_titles": [
             {
                 "title": clean_text(row.get("title")),
                 "primary_keyword": clean_text(row.get("primary_keyword")),
-                "action_taken": clean_text(row.get("action_taken")),
+                "status": clean_text(row.get("status")),
             }
-            for row in site_data["history_rows"]
+            for row in existing_rows
+            if clean_text(row.get("status")) in {"published", "ignored", "verification_failed", "completed"}
         ],
         "insights": site_data["insights"][:4],
         "support_signals": support_signals,
@@ -981,6 +1135,7 @@ def build_stored_arvow_payload(site_name: str, enriched: dict[str, Any]) -> dict
             "supporting_insights": enriched.get("supporting_insights", []),
             "priority_score": enriched.get("priority_score"),
             "priority_label": priority_label(int(enriched.get("priority_score") or 0)),
+            "trend_label": enriched.get("trend_label") or "steady",
         },
     }
 
@@ -997,6 +1152,12 @@ def make_row(site_name: str, item: dict[str, Any]) -> dict[str, Any]:
         "priority_score": int(item.get("priority_score") or 0),
         "status": "pending",
         "arvow_payload": item.get("arvow_payload"),
+        "arvow_batch_id": None,
+        "arvow_job_id": None,
+        "sent_to_arvow_at": None,
+        "published_url": None,
+        "verified_at": None,
+        "verification_notes": clean_text(item.get("verification_notes")),
         "created_at": now,
         "updated_at": now,
         "generated_date": today_iso(),
@@ -1017,7 +1178,13 @@ def save_rows(client, rows: list[dict[str, Any]], dry_run: bool) -> int:
 
 
 def process_site(site_data: dict[str, Any], openai_client: OpenAI | None, *, dry_run: bool = False) -> list[dict[str, Any]]:
-    active_count = len(site_data["active_rows"])
+    active_count = len(
+        [
+            row
+            for row in site_data["active_rows"]
+            if clean_text(row.get("status")) not in {"published", "ignored", "verification_failed", "completed"}
+        ]
+    )
     slots_available = max(0, ACTIVE_QUEUE_TARGET - active_count)
     if slots_available == 0:
         logger.info("[%s] active queue already has %d items; no new rows generated", site_data["site"], active_count)
@@ -1039,7 +1206,7 @@ def process_site(site_data: dict[str, Any], openai_client: OpenAI | None, *, dry
     validation = validate_titles(openai_client, site_payload, analysis, generated)
     approved_items = validation.get("approved") or generated_items
 
-    recent_rows = site_data["active_rows"] + site_data["history_rows"]
+    recent_rows = site_data["active_rows"]
     filtered_items: list[dict[str, Any]] = []
     seen_local: set[str] = set()
     for item in approved_items:
@@ -1062,6 +1229,7 @@ def process_site(site_data: dict[str, Any], openai_client: OpenAI | None, *, dry
                 "cluster_id": clean_text(item.get("cluster_id")) or None,
                 "reasoning": reasoning,
                 "priority_score": max(1, min(100, score)),
+                "trend_label": clean_text(item.get("trend_label")) or "steady",
             }
         )
         if len(filtered_items) >= slots_available + 2:
@@ -1104,6 +1272,7 @@ def process_site(site_data: dict[str, Any], openai_client: OpenAI | None, *, dry
                     "priority_score": score,
                     "cluster_id": clean_text(item.get("cluster_id") or (matched or {}).get("cluster_id")) or None,
                     "reasoning": clean_text(item.get("reasoning") or (matched or {}).get("reasoning")),
+                    "trend_label": clean_text((matched or {}).get("trend_label")),
                 },
             ),
         }

@@ -1,4 +1,4 @@
-name: Daily Content Opportunities
+name: Daily Content Opportunities And Arvow Automation
 
 on:
   schedule:
@@ -19,11 +19,30 @@ jobs:
   generate-daily-content-opportunities:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          python - <<'PY'
+          import os, sys
+          required = [
+              "SUPABASE_URL",
+              "SUPABASE_SERVICE_KEY",
+              "OPENAI_API_KEY",
+              "ARVOW_API_KEY",
+              "ARVOW_INTEGRATION_ID_FREEDOMX",
+              "ARVOW_INTEGRATION_ID_FASHIONABC",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              print("Missing required secrets:", ", ".join(missing))
+              sys.exit(1)
+          print("All required secrets are present.")
+          PY
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,18 +53,30 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate daily content opportunities
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ARVOW_API_KEY: ${{ secrets.ARVOW_API_KEY }}
-          ARVOW_INTEGRATION_ID_CITIESABC: ${{ secrets.ARVOW_INTEGRATION_ID_CITIESABC }}
-          ARVOW_INTEGRATION_ID_BUSINESSABC: ${{ secrets.ARVOW_INTEGRATION_ID_BUSINESSABC }}
-          ARVOW_INTEGRATION_ID_HEDGETHINK: ${{ secrets.ARVOW_INTEGRATION_ID_HEDGETHINK }}
-          ARVOW_INTEGRATION_ID_FASHIONABC: ${{ secrets.ARVOW_INTEGRATION_ID_FASHIONABC }}
-          ARVOW_INTEGRATION_ID_TRADERSDNA: ${{ secrets.ARVOW_INTEGRATION_ID_TRADERSDNA }}
-          ARVOW_INTEGRATION_ID_FREEDOMX: ${{ secrets.ARVOW_INTEGRATION_ID_FREEDOMX }}
-          ARVOW_INTEGRATION_ID_WISDOMIA: ${{ secrets.ARVOW_INTEGRATION_ID_WISDOMIA }}
-          ARVOW_INTEGRATION_ID_SPORTSDNA: ${{ secrets.ARVOW_INTEGRATION_ID_SPORTSDNA }}
-          ARVOW_INTEGRATION_ID_INTELLIGENTHQ: ${{ secrets.ARVOW_INTEGRATION_ID_INTELLIGENTHQ }}
         run: python scripts/generate_daily_content_opportunities.py
+
+      - name: Auto-publish top 4/day to Arvow for enabled sites
+        run: python scripts/auto_publish_arvow.py
+
+      - name: Wait before publication verification
+        run: sleep $(( ARVOW_VERIFY_MIN_DELAY_MINUTES * 60 ))
+
+      - name: Verify Arvow publishes and sync clusters
+        run: python scripts/verify_arvow_publish.py
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ARVOW_API_KEY: ${{ secrets.ARVOW_API_KEY }}
+      ARVOW_INTEGRATION_ID_CITIESABC: ${{ secrets.ARVOW_INTEGRATION_ID_CITIESABC }}
+      ARVOW_INTEGRATION_ID_BUSINESSABC: ${{ secrets.ARVOW_INTEGRATION_ID_BUSINESSABC }}
+      ARVOW_INTEGRATION_ID_HEDGETHINK: ${{ secrets.ARVOW_INTEGRATION_ID_HEDGETHINK }}
+      ARVOW_INTEGRATION_ID_FASHIONABC: ${{ secrets.ARVOW_INTEGRATION_ID_FASHIONABC }}
+      ARVOW_INTEGRATION_ID_TRADERSDNA: ${{ secrets.ARVOW_INTEGRATION_ID_TRADERSDNA }}
+      ARVOW_INTEGRATION_ID_FREEDOMX: ${{ secrets.ARVOW_INTEGRATION_ID_FREEDOMX }}
+      ARVOW_INTEGRATION_ID_WISDOMIA: ${{ secrets.ARVOW_INTEGRATION_ID_WISDOMIA }}
+      ARVOW_INTEGRATION_ID_SPORTSDNA: ${{ secrets.ARVOW_INTEGRATION_ID_SPORTSDNA }}
+      ARVOW_INTEGRATION_ID_INTELLIGENTHQ: ${{ secrets.ARVOW_INTEGRATION_ID_INTELLIGENTHQ }}
+      ARVOW_VERIFY_MIN_DELAY_MINUTES: "45"
+      ARVOW_VERIFY_MAX_ATTEMPTS: "4"
+      ARVOW_VERIFY_ATTEMPT_WINDOWS: "45,90,180,360"

@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   generate-daily-content-opportunities:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 120
 

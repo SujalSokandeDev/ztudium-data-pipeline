@@ -23,3 +23,9 @@ Thumbs.db
 # Temp files
 *.tmp
 temp/
+
+# Keep operational artifacts local-only
+database/
+graphify-out/
+*.md
+!README.md

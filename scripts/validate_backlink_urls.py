@@ -31,6 +31,8 @@ logging.basicConfig(
 logger = logging.getLogger("validate_backlink_urls")
 
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+CHECKPOINT_TABLE = os.getenv("URL_VALIDATION_CHECKPOINT_TABLE", "pipeline_checkpoints")
+CHECKPOINT_KEY = "validate_backlink_urls"
 SOFT_404_PATTERNS = (
     "page not found",
     "not found",
@@ -295,6 +297,58 @@ def chunked(items: list[dict], size: int) -> Iterable[list[dict]]:
         yield items[index:index + size]
 
 
+def load_checkpoint(client) -> tuple[str | None, str | None]:
+    try:
+        response = (
+            client.table(CHECKPOINT_TABLE)
+            .select("last_table,last_row_id")
+            .eq("pipeline_name", CHECKPOINT_KEY)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Checkpoint load skipped: %s", str(exc)[:200])
+        return None, None
+
+    row = (response.data or [{}])[0]
+    return row.get("last_table"), row.get("last_row_id")
+
+
+def save_checkpoint(client, last_table: str, last_row_id: str, processed: int):
+    payload = {
+        "pipeline_name": CHECKPOINT_KEY,
+        "last_table": last_table,
+        "last_row_id": str(last_row_id),
+        "metadata": {
+            "processed": processed,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        client.table(CHECKPOINT_TABLE).upsert(payload, on_conflict="pipeline_name").execute()
+    except Exception as exc:
+        logger.warning("Checkpoint save skipped: %s", str(exc)[:200])
+
+
+def order_items_for_resume(all_items: list[tuple[str, dict]], checkpoint: tuple[str | None, str | None]):
+    ordered = sorted(all_items, key=lambda item: (item[0], str(item[1].get("id") or "")))
+    last_table, last_row_id = checkpoint
+    if not last_table or not last_row_id:
+        return ordered
+
+    tail = [
+        item
+        for item in ordered
+        if (item[0], str(item[1].get("id") or "")) > (last_table, str(last_row_id))
+    ]
+    if tail:
+        return tail
+
+    logger.info("Checkpoint reached end of list; wrapping back to the first backlog item.")
+    return ordered
+
+
 def apply_validation_update(client, table: str, row_id: str, status: str, notes: str):
     payload = {
         "validation_status": status,
@@ -370,6 +424,8 @@ def run_validation(batch_size: int, batch_delay: float, recheck_resolved_after_h
     all_items = [("ahrefs_broken_backlinks", row) for row in broken_rows] + [
         ("ahrefs_lost_backlinks", row) for row in lost_rows
     ]
+    checkpoint = load_checkpoint(client)
+    all_items = order_items_for_resume(all_items, checkpoint)
 
     summary = {
         "checked": 0,
@@ -379,16 +435,19 @@ def run_validation(batch_size: int, batch_delay: float, recheck_resolved_after_h
     }
 
     logger.info(
-        "Validating %d backlink rows (%d broken + %d lost) in batches of %d (resolved recheck window: %dh)",
+        "Validating %d backlink rows (%d broken + %d lost) in batches of %d (resolved recheck window: %dh, checkpoint=%s/%s)",
         len(all_items),
         len(broken_rows),
         len(lost_rows),
         batch_size,
         recheck_resolved_after_hours,
+        checkpoint[0] or "none",
+        checkpoint[1] or "none",
     )
 
     for batch_number, batch in enumerate(chunked(all_items, batch_size), start=1):
         logger.info("Processing batch %d (%d rows)", batch_number, len(batch))
+        last_processed: tuple[str, str] | None = None
         for table, row in batch:
             try:
                 if table == "ahrefs_broken_backlinks":
@@ -409,6 +468,13 @@ def run_validation(batch_size: int, batch_delay: float, recheck_resolved_after_h
                 )
                 summary["checked"] += 1
                 summary["needs_review"] += 1
+            finally:
+                row_id = str(row.get("id") or "")
+                if row_id:
+                    last_processed = (table, row_id)
+
+        if last_processed:
+            save_checkpoint(client, last_processed[0], last_processed[1], summary["checked"])
 
         if batch_delay > 0:
             time.sleep(batch_delay)

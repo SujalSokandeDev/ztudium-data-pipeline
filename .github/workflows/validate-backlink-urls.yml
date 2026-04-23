@@ -29,4 +29,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          URL_VALIDATION_CHECKPOINT_TABLE: pipeline_checkpoints
         run: python scripts/validate_backlink_urls.py --batch-size 50 --batch-delay 2

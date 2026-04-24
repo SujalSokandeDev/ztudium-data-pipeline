@@ -13,7 +13,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
 from urllib.parse import urlparse
 
 import requests
@@ -33,6 +33,8 @@ logger = logging.getLogger("validate_backlink_urls")
 TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 CHECKPOINT_TABLE = os.getenv("URL_VALIDATION_CHECKPOINT_TABLE", "pipeline_checkpoints")
 CHECKPOINT_KEY = "validate_backlink_urls"
+SUPABASE_WRITE_RETRIES = int(os.getenv("URL_VALIDATION_SUPABASE_RETRIES", "3"))
+SUPABASE_RETRY_DELAY_SECONDS = float(os.getenv("URL_VALIDATION_SUPABASE_RETRY_DELAY_SECONDS", "2"))
 SOFT_404_PATTERNS = (
     "page not found",
     "not found",
@@ -41,6 +43,30 @@ SOFT_404_PATTERNS = (
     "404",
     "error page",
 )
+
+T = TypeVar("T")
+
+
+def execute_with_retries(operation: str, call: Callable[[], T], attempts: int = SUPABASE_WRITE_RETRIES) -> T:
+    last_error: Exception | None = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            return call()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max(attempts, 1):
+                break
+            delay = SUPABASE_RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                "%s failed (attempt %d/%d): %s; retrying in %.1fs",
+                operation,
+                attempt,
+                attempts,
+                str(exc)[:200],
+                delay,
+            )
+            time.sleep(delay)
+    raise last_error or RuntimeError(f"{operation} failed")
 
 
 def normalize_url(raw_url: str) -> str | None:
@@ -235,7 +261,10 @@ def fetch_all_rows(client, table: str, page_size: int = 1000) -> list[dict]:
     rows = []
     start = 0
     while True:
-        response = client.table(table).select("*").range(start, start + page_size - 1).execute()
+        response = execute_with_retries(
+            f"fetch {table} rows {start}-{start + page_size - 1}",
+            lambda: client.table(table).select("*").range(start, start + page_size - 1).execute(),
+        )
         chunk = response.data or []
         rows.extend(chunk)
         if len(chunk) < page_size:
@@ -248,12 +277,15 @@ def fetch_rows_by_status(client, table: str, status: str, page_size: int = 1000)
     rows = []
     start = 0
     while True:
-        response = (
-            client.table(table)
-            .select("*")
-            .eq("validation_status", status)
-            .range(start, start + page_size - 1)
-            .execute()
+        response = execute_with_retries(
+            f"fetch {table} {status} rows {start}-{start + page_size - 1}",
+            lambda: (
+                client.table(table)
+                .select("*")
+                .eq("validation_status", status)
+                .range(start, start + page_size - 1)
+                .execute()
+            ),
         )
         chunk = response.data or []
         rows.extend(chunk)
@@ -299,12 +331,15 @@ def chunked(items: list[dict], size: int) -> Iterable[list[dict]]:
 
 def load_checkpoint(client) -> tuple[str | None, str | None]:
     try:
-        response = (
-            client.table(CHECKPOINT_TABLE)
-            .select("last_table,last_row_id")
-            .eq("pipeline_name", CHECKPOINT_KEY)
-            .limit(1)
-            .execute()
+        response = execute_with_retries(
+            "load URL validation checkpoint",
+            lambda: (
+                client.table(CHECKPOINT_TABLE)
+                .select("last_table,last_row_id")
+                .eq("pipeline_name", CHECKPOINT_KEY)
+                .limit(1)
+                .execute()
+            ),
         )
     except Exception as exc:
         logger.warning("Checkpoint load skipped: %s", str(exc)[:200])
@@ -326,7 +361,10 @@ def save_checkpoint(client, last_table: str, last_row_id: str, processed: int):
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        client.table(CHECKPOINT_TABLE).upsert(payload, on_conflict="pipeline_name").execute()
+        execute_with_retries(
+            "save URL validation checkpoint",
+            lambda: client.table(CHECKPOINT_TABLE).upsert(payload, on_conflict="pipeline_name").execute(),
+        )
     except Exception as exc:
         logger.warning("Checkpoint save skipped: %s", str(exc)[:200])
 
@@ -349,7 +387,7 @@ def order_items_for_resume(all_items: list[tuple[str, dict]], checkpoint: tuple[
     return ordered
 
 
-def apply_validation_update(client, table: str, row_id: str, status: str, notes: str):
+def apply_validation_update(client, table: str, row_id: str, status: str, notes: str) -> bool:
     payload = {
         "validation_status": status,
         "validation_notes": notes[:1000],
@@ -359,7 +397,15 @@ def apply_validation_update(client, table: str, row_id: str, status: str, notes:
         payload["resolved_at"] = datetime.now(timezone.utc).isoformat()
     else:
         payload["resolved_at"] = None
-    client.table(table).update(payload).eq("id", row_id).execute()
+    try:
+        execute_with_retries(
+            f"update {table} row {row_id}",
+            lambda: client.table(table).update(payload).eq("id", row_id).execute(),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("%s row %s update skipped after retries: %s", table, row_id, str(exc)[:200])
+        return False
 
 
 def validate_broken_backlink_row(row: dict) -> tuple[str, str]:

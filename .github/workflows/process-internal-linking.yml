@@ -58,6 +58,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           INTERNAL_LINKING_BYPASS_LAYER2: ${{ github.event.inputs.bypass_layer2 == 'true' && '1' || '' }}
           INTERNAL_LINKING_DEBUG_PAYLOAD: ${{ github.event.inputs.debug_payload == 'true' && '1' || '' }}
         run: python scripts/process_ahrefs.py --date-folder ${{ steps.date.outputs.folder }} --internal-linking-only

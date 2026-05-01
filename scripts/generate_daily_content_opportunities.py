@@ -48,6 +48,7 @@ from daily_content_prompt_config import (  # noqa: E402
     SITE_ANALYSIS_PROMPT,
     VALIDATION_PROMPT,
 )
+from ai_client import get_ai_client, ai_chat_completion  # noqa: E402
 
 
 logging.basicConfig(
@@ -65,6 +66,7 @@ logging.getLogger("supabase").setLevel(logging.WARNING)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 ACTIVE_QUEUE_TARGET = 6
 RECENT_DEDUPE_DAYS = 7
@@ -350,7 +352,7 @@ def fallback_openai_json(system_prompt: str, payload: dict[str, Any]) -> dict[st
 def openai_json(client: OpenAI | None, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
     if client is None:
         return fallback_openai_json(system_prompt, payload)
-    response = client.chat.completions.create(
+    response = ai_chat_completion(
         model=OPENAI_MODEL,
         temperature=0.2,
         response_format={"type": "json_object"},
@@ -1302,10 +1304,10 @@ def main() -> None:
     if not args.use_sample_data:
         require_env("SUPABASE_URL", SUPABASE_URL)
         require_env("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
-    if not OPENAI_API_KEY and not args.use_sample_data:
-        require_env("OPENAI_API_KEY", OPENAI_API_KEY)
+    if not OPENAI_API_KEY and not GEMINI_API_KEY and not args.use_sample_data:
+        require_env("OPENAI_API_KEY or GEMINI_API_KEY", "")
 
-    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    openai_client = get_ai_client()
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if not args.use_sample_data else None
 
     logger.info("Loading %s dataset", "sample" if args.use_sample_data else "live")

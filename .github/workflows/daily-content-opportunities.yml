@@ -37,6 +37,8 @@ jobs:
               "ARVOW_INTEGRATION_ID_FREEDOMX",
               "ARVOW_INTEGRATION_ID_FASHIONABC",
           ]
+          # GEMINI_API_KEY is optional (fallback provider)
+          optional_ai = ["GEMINI_API_KEY"]
           missing = [name for name in required if not os.getenv(name)]
           if missing:
               print("Missing required secrets:", ", ".join(missing))
@@ -67,6 +69,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       ARVOW_API_KEY: ${{ secrets.ARVOW_API_KEY }}
       ARVOW_INTEGRATION_ID_CITIESABC: ${{ secrets.ARVOW_INTEGRATION_ID_CITIESABC }}
       ARVOW_INTEGRATION_ID_BUSINESSABC: ${{ secrets.ARVOW_INTEGRATION_ID_BUSINESSABC }}

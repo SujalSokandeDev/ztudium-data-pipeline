@@ -36,20 +36,24 @@ except ImportError as e:
     logger.error(f"Missing package: {e}. Run: pip install supabase openai")
     sys.exit(1)
 
+from ai_client import get_ai_client, ai_chat_completion
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     logger.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
     sys.exit(1)
 
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY must be set")
+if not OPENAI_API_KEY and not GEMINI_API_KEY:
+    logger.error("At least one of OPENAI_API_KEY or GEMINI_API_KEY must be set")
     sys.exit(1)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# AI client with automatic Gemini fallback (managed by ai_client module)
+openai_client = get_ai_client()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -715,7 +719,7 @@ def generate_insights(context):
 
     try:
         with Spinner("Analyzing strategic insights"):
-            response = openai_client.chat.completions.create(
+            response = ai_chat_completion(
                 model="gpt-4o",
                 temperature=0.3,
                 max_tokens=3000,
@@ -760,7 +764,7 @@ def generate_insights(context):
             "severity": "low",
             "title": "Insight generation encountered a parsing issue",
             "analysis": "Analysis ran but the response format was unexpected. This is typically temporary.",
-            "action": "Re-run the insight generation script. If this persists, check the OPENAI_API_KEY.",
+            "action": "Re-run the insight generation script. If this persists, check OPENAI_API_KEY or GEMINI_API_KEY.",
             "impact": "No impact on dashboard functionality.",
             "related_website": "all"
         }]
@@ -771,7 +775,7 @@ def generate_insights(context):
             "severity": "low",
             "title": "Insights generation failed",
             "analysis": f"The analysis API call returned an error: {str(e)[:200]}",
-            "action": "Check OPENAI_API_KEY is valid and has credits. Re-run the script.",
+            "action": "Check OPENAI_API_KEY or GEMINI_API_KEY is valid and has credits. Re-run the script.",
             "impact": "No insights generated for today. Previous insights remain visible.",
             "related_website": "all"
         }]
@@ -1106,7 +1110,7 @@ def generate_content_plan(context):
     # ── Step 4: AI clustering call ──
     try:
         with Spinner("Building keyword clusters"):
-            response = openai_client.chat.completions.create(
+            response = ai_chat_completion(
                 model="gpt-4o",
                 temperature=0.4,
                 max_tokens=16000,

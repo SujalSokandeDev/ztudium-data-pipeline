@@ -43,6 +43,8 @@ try:
 except ImportError:  # pragma: no cover - available in normal runtime
     OpenAI = None
 
+from ai_client import get_ai_client, ai_json_response as _ai_json_response_fallback, ai_chat_completion
+
 if load_dotenv:
     load_dotenv()
 
@@ -57,10 +59,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 INTERNAL_LINKING_MODEL = "gpt-4o"
 INTERNAL_LINKING_BYPASS_LAYER2 = os.getenv("INTERNAL_LINKING_BYPASS_LAYER2", "").strip().lower() in {"1", "true", "yes"}
 INTERNAL_LINKING_DEBUG_PAYLOAD = os.getenv("INTERNAL_LINKING_DEBUG_PAYLOAD", "").strip().lower() in {"1", "true", "yes"}
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
+# AI client with automatic Gemini fallback (managed by ai_client module)
+openai_client = get_ai_client()
 _layer1_debug_logged = False
 
 SITE_CONTEXT = {
@@ -951,26 +955,15 @@ def _light_prefilter_donors(
     return filtered[:max_candidates]
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception(lambda exc: True),
-)
 def _openai_json_response(system_prompt: str, payload: dict) -> dict:
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY is required for AI internal linking suggestions")
-    response = openai_client.chat.completions.create(
+    if not get_ai_client():
+        raise RuntimeError("OPENAI_API_KEY or GEMINI_API_KEY is required for AI internal linking suggestions")
+    return _ai_json_response_fallback(
+        system_prompt,
+        payload,
         model=INTERNAL_LINKING_MODEL,
         temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
     )
-    content = response.choices[0].message.content or "{}"
-    return json.loads(content)
 
 
 def _build_target_payload(target: dict, page_map: dict[str, dict], target_site: str) -> dict:
@@ -1318,8 +1311,8 @@ def _generate_ai_suggestions_for_scope(
     limit: int,
     existing_pairs: set[tuple[str, str]] | None = None,
 ) -> list[dict]:
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY is required for internal linking generation")
+    if not get_ai_client():
+        raise RuntimeError("OPENAI_API_KEY or GEMINI_API_KEY is required for internal linking generation")
 
     logger.info(
         "  internal_linking[%s]: %s -> %s | %d targets, %d donor pages",
@@ -1785,6 +1778,185 @@ def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source
 #  Supabase DB upload
 # ══════════════════════════════════════════════════════════════
 
+def _internal_link_cluster_group_key(row: dict) -> tuple[str, str]:
+    scope = row.get("suggestion_scope") or "within_site"
+    if scope == "cross_platform":
+        site = row.get("source_website") or row.get("website") or "Unknown"
+    else:
+        site = row.get("website") or row.get("source_website") or "Unknown"
+    return scope, site
+
+
+def _build_internal_link_cluster_components(rows: list[dict]) -> list[list[int]]:
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for index, row in enumerate(rows):
+        source = _normalize_url(row.get("source_page", ""))
+        target = _normalize_url(row.get("target_page", ""))
+        if not source or not target or source == target:
+            continue
+        grouped.setdefault(_internal_link_cluster_group_key(row), []).append(index)
+
+    components: list[list[int]] = []
+    for indices in grouped.values():
+        adjacency: dict[str, set[str]] = {}
+        node_edges: dict[str, list[int]] = {}
+        for index in indices:
+            row = rows[index]
+            source = _normalize_url(row.get("source_page", ""))
+            target = _normalize_url(row.get("target_page", ""))
+            adjacency.setdefault(source, set()).add(target)
+            adjacency.setdefault(target, set()).add(source)
+            node_edges.setdefault(source, []).append(index)
+            node_edges.setdefault(target, []).append(index)
+
+        visited: set[str] = set()
+        for start in adjacency.keys():
+            if start in visited:
+                continue
+            stack = [start]
+            component_nodes: set[str] = set()
+            visited.add(start)
+            while stack:
+                current = stack.pop()
+                component_nodes.add(current)
+                for next_node in adjacency.get(current, set()):
+                    if next_node in visited:
+                        continue
+                    visited.add(next_node)
+                    stack.append(next_node)
+
+            component_indices = sorted({
+                edge_index
+                for node in component_nodes
+                for edge_index in node_edges.get(node, [])
+            })
+            if component_indices:
+                components.append(component_indices)
+    return components
+
+
+def _generate_internal_link_cluster_reason(component_rows: list[dict]) -> str | None:
+    if not get_ai_client():
+        return None
+
+    page_stats: dict[str, dict] = {}
+    for row in component_rows:
+        source = _normalize_url(row.get("source_page", ""))
+        target = _normalize_url(row.get("target_page", ""))
+        if not source or not target:
+            continue
+        source_stats = page_stats.setdefault(source, {
+            "url": source,
+            "title": _infer_page_title(source),
+            "in_degree": 0,
+            "out_degree": 0,
+            "keywords": set(),
+        })
+        target_stats = page_stats.setdefault(target, {
+            "url": target,
+            "title": _infer_page_title(target, row.get("target_page_keyword", "")),
+            "in_degree": 0,
+            "out_degree": 0,
+            "keywords": set(),
+        })
+        source_stats["out_degree"] += 1
+        target_stats["in_degree"] += 1
+        keyword = (row.get("target_page_keyword") or "").strip()
+        if keyword:
+            target_stats["keywords"].add(keyword)
+
+    pages = sorted(
+        page_stats.values(),
+        key=lambda item: (
+            item["in_degree"] + item["out_degree"],
+            item["out_degree"],
+            item["title"],
+        ),
+        reverse=True,
+    )
+    links = sorted(
+        component_rows,
+        key=lambda row: (row.get("score") or 0, row.get("ai_confidence") or 0),
+        reverse=True,
+    )
+
+    result = _openai_json_response(
+        system_prompt=(
+            "You are an SEO editor explaining an internal-linking topic cluster. "
+            "Write one concise, factual prose explanation of why these pages belong in the same cluster. "
+            "Base the explanation only on the page titles, keywords, and suggested links provided. "
+            "Do not list links, do not invent facts, and do not say the pages are related only because they are in the same broad category. "
+            "Return JSON with a `cluster_reason` string only."
+        ),
+        payload={
+            "scope": component_rows[0].get("suggestion_scope") or "within_site",
+            "source_site": component_rows[0].get("source_website") or component_rows[0].get("website"),
+            "target_sites": sorted({
+                row.get("target_website") or row.get("website") or ""
+                for row in component_rows
+                if row.get("target_website") or row.get("website")
+            }),
+            "pages": [
+                {
+                    "url": page["url"],
+                    "title": page["title"],
+                    "in_degree": page["in_degree"],
+                    "out_degree": page["out_degree"],
+                    "keywords": sorted(page["keywords"])[:5],
+                }
+                for page in pages[:12]
+            ],
+            "suggested_links": [
+                {
+                    "source_page": row.get("source_page"),
+                    "target_page": row.get("target_page"),
+                    "target_keyword": row.get("target_page_keyword"),
+                    "anchor": row.get("suggested_anchor"),
+                    "reason": row.get("reason"),
+                    "score": row.get("score"),
+                }
+                for row in links[:18]
+            ],
+            "instructions": {
+                "length": "35 to 70 words",
+                "style": "plain prose for a client-facing SEO dashboard",
+                "must_explain": "the shared topic or reader journey connecting the pillar and supporting pages",
+            },
+        },
+    )
+    reason = (result.get("cluster_reason") or "").strip()
+    if len(reason) < 40:
+        return None
+    return reason[:700]
+
+
+def populate_internal_link_cluster_reasons(rows: list[dict]) -> None:
+    if not rows:
+        return
+    if not get_ai_client():
+        logger.info("  internal_linking: skipped cluster_reason generation (no AI provider configured)")
+        return
+
+    components = _build_internal_link_cluster_components(rows)
+    generated = 0
+    for component_indices in components:
+        component_rows = [rows[index] for index in component_indices]
+        if len(component_rows) == 1:
+            continue
+        try:
+            reason = _generate_internal_link_cluster_reason(component_rows)
+        except Exception as exc:
+            logger.warning("  internal_linking: cluster_reason generation failed: %s", str(exc)[:160])
+            continue
+        if not reason:
+            continue
+        for index in component_indices:
+            rows[index]["cluster_reason"] = reason
+        generated += 1
+
+    logger.info("  internal_linking: generated cluster_reason for %d clusters", generated)
+
+
 def batch_upsert(client, table, rows, conflict_cols):
     """Batch upsert with key normalization."""
     if not rows:
@@ -2007,6 +2179,8 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
                 continue
             suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
         suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+        if internal_links_has_cluster_reason:
+            populate_internal_link_cluster_reasons(suggestion_rows)
         if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
             for row in suggestion_rows:
                 if not internal_links_has_reason:
@@ -2230,6 +2404,8 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
     suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+    if internal_links_has_cluster_reason:
+        populate_internal_link_cluster_reasons(suggestion_rows)
     if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
         for row in suggestion_rows:
             if not internal_links_has_reason:

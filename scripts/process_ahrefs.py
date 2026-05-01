@@ -1991,6 +1991,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     competitors_has_ingestion_run_id = _supports_column(client, "ahrefs_competitors", "ingestion_run_id")
     internal_links_has_reason = _supports_column(client, "internal_linking_suggestions", "reason")
     internal_links_has_ai_confidence = _supports_column(client, "internal_linking_suggestions", "ai_confidence")
+    internal_links_has_cluster_reason = _supports_column(client, "internal_linking_suggestions", "cluster_reason")
     websites_in_run = sorted(parsed_data.keys())
 
     if internal_linking_only:
@@ -2006,12 +2007,14 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
                 continue
             suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
         suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
-        if not internal_links_has_reason or not internal_links_has_ai_confidence:
+        if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
             for row in suggestion_rows:
                 if not internal_links_has_reason:
                     row.pop("reason", None)
                 if not internal_links_has_ai_confidence:
                     row.pop("ai_confidence", None)
+                if not internal_links_has_cluster_reason:
+                    row.pop("cluster_reason", None)
         c = batch_upsert(
             client,
             "internal_linking_suggestions",
@@ -2227,12 +2230,14 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
     suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
-    if not internal_links_has_reason or not internal_links_has_ai_confidence:
+    if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
         for row in suggestion_rows:
             if not internal_links_has_reason:
                 row.pop("reason", None)
             if not internal_links_has_ai_confidence:
                 row.pop("ai_confidence", None)
+            if not internal_links_has_cluster_reason:
+                row.pop("cluster_reason", None)
     c = batch_upsert(
         client,
         "internal_linking_suggestions",

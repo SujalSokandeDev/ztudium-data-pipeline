@@ -1,7 +1,7 @@
 """
 ai_client.py — Unified AI client with automatic Gemini fallback.
 
-Provides OpenAI as the primary provider and Gemini 2.5 Flash as a
+Provides OpenAI as the primary provider and Gemini 3.1 Pro as a
 fallback. Once OpenAI fails (quota, rate-limit, or API error), the
 module switches to Gemini for ALL remaining calls in the current run.
 
@@ -26,7 +26,7 @@ logger = logging.getLogger("ai_client")
 
 # ── Constants ───────────────────────────────────────────────
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.1-pro"
 
 # Map OpenAI model names → Gemini equivalents
 _MODEL_MAP = {

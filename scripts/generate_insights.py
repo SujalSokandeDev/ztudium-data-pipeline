@@ -721,7 +721,6 @@ def generate_insights(context):
         with Spinner("Analyzing strategic insights"):
             response = ai_chat_completion(
                 model="gpt-4o",
-                fallback_model="gemini-2.5-pro",
                 temperature=0.3,
                 max_tokens=3000,
                 messages=[
@@ -1125,7 +1124,6 @@ def generate_content_plan(context):
         with Spinner("Building keyword clusters"):
             response = ai_chat_completion(
                 model="gpt-4o",
-                fallback_model="gemini-2.5-pro",
                 temperature=0.4,
                 max_tokens=16000,
                 response_format={"type": "json_object"},

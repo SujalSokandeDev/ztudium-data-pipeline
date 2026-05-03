@@ -721,6 +721,7 @@ def generate_insights(context):
         with Spinner("Analyzing strategic insights"):
             response = ai_chat_completion(
                 model="gpt-4o",
+                fallback_model="gemini-2.5-pro",
                 temperature=0.3,
                 max_tokens=3000,
                 messages=[
@@ -741,13 +742,25 @@ def generate_insights(context):
         if raw.endswith("```"):
             raw = raw[:-3]
         raw = raw.strip()
-        # Also handle ```json prefix
         if raw.startswith("json"):
             raw = raw[4:].strip()
 
-        insights = json.loads(raw)
-        if not isinstance(insights, list):
-            insights = [insights]
+        # Attempt to auto-close truncated JSON arrays/objects
+        if raw and not raw.endswith("]") and not raw.endswith("}"):
+            raw = raw.rstrip(", ")
+            if raw.startswith("["):
+                raw += "}]" if "{" in raw[raw.rfind("},"):] else "]"
+            elif raw.startswith("{"):
+                raw += "}"
+
+        try:
+            insights = json.loads(raw)
+            if not isinstance(insights, list):
+                insights = [insights]
+        except json.JSONDecodeError as e:
+            logger.error(f"  Failed to parse analysis response: {e}")
+            logger.error(f"  Raw response preview: {raw[:300]}...")
+            return []
 
         # Sort by severity
         severity_order = {"high": 0, "medium": 1, "low": 2}
@@ -1112,6 +1125,7 @@ def generate_content_plan(context):
         with Spinner("Building keyword clusters"):
             response = ai_chat_completion(
                 model="gpt-4o",
+                fallback_model="gemini-2.5-pro",
                 temperature=0.4,
                 max_tokens=16000,
                 response_format={"type": "json_object"},
@@ -1136,6 +1150,11 @@ def generate_content_plan(context):
         match = re.search(r"\{.*\}", raw, flags=re.S)
         if match:
             raw = match.group(0)
+
+        # Attempt to auto-close truncated JSON arrays/objects
+        if raw and not raw.endswith("}"):
+            raw = raw.rstrip(", ")
+            raw += "}]}"
 
         plan = json.loads(raw)
 

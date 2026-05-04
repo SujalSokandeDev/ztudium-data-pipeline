@@ -22,12 +22,14 @@ import io
 import time
 import json
 import uuid
+import hashlib
 import logging
 import argparse
 import tempfile
 import requests
 from datetime import date, datetime
 from urllib.parse import urlparse
+from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -955,6 +957,15 @@ def _light_prefilter_donors(
     return filtered[:max_candidates]
 
 
+def _coerce_confidence(val: any) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def _openai_json_response(system_prompt: str, payload: dict) -> dict:
     if not get_ai_client():
         raise RuntimeError("OPENAI_API_KEY or GEMINI_API_KEY is required for AI internal linking suggestions")
@@ -1659,8 +1670,553 @@ def _generate_ai_suggestions_for_scope(
     return suggestions[:limit]
 
 
+# ══════════════════════════════════════════════════════════════
+#  Cluster-First Internal Linking Engine v2
+# ══════════════════════════════════════════════════════════════
+
+CLUSTER_SIMILARITY_THRESHOLD = 6
+CLUSTER_MIN_SIZE = 3
+CLUSTER_MAX_SIZE = 12
+
+
+def _compute_page_similarity(page_a: dict, page_b: dict) -> float:
+    """Compute weighted similarity score between two enriched pages."""
+    score = 0.0
+    tokens_a = set(page_a.get("topic_tokens") or set())
+    tokens_b = set(page_b.get("topic_tokens") or set())
+    if tokens_a and tokens_b:
+        union = tokens_a | tokens_b
+        intersection = tokens_a & tokens_b
+        if union:
+            score += (len(intersection) / len(union)) * 5
+    section_a = page_a.get("section", "")
+    section_b = page_b.get("section", "")
+    if section_a and section_b and section_a == section_b:
+        score += 4
+    keywords_a = {
+        (kw.get("keyword") or "").lower().strip()
+        for kw in (page_a.get("top_keywords") or [])
+        if kw.get("keyword")
+    }
+    keywords_b = {
+        (kw.get("keyword") or "").lower().strip()
+        for kw in (page_b.get("top_keywords") or [])
+        if kw.get("keyword")
+    }
+    if keywords_a & keywords_b:
+        score += 3
+    url_tokens_a = _url_path_tokens(page_a.get("url", ""))
+    url_tokens_b = _url_path_tokens(page_b.get("url", ""))
+    if url_tokens_a & url_tokens_b:
+        score += 2
+    return score
+
+
+def _detect_topic_clusters(enriched_pages: list[dict], site_name: str) -> list[dict]:
+    """Group enriched pages into topic clusters using heuristic similarity BEFORE linking."""
+    if len(enriched_pages) < CLUSTER_MIN_SIZE:
+        logger.info("  cluster_detect[%s]: too few pages (%d), skipping", site_name, len(enriched_pages))
+        return []
+
+    pages = list(enriched_pages)
+    n = len(pages)
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = _compute_page_similarity(pages[i], pages[j])
+            if sim >= CLUSTER_SIMILARITY_THRESHOLD:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+    visited: set[int] = set()
+    raw_components: list[list[int]] = []
+    for start in range(n):
+        if start in visited:
+            continue
+        stack = [start]
+        component: set[int] = set()
+        visited.add(start)
+        while stack:
+            current = stack.pop()
+            component.add(current)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        if len(component) >= 2:
+            raw_components.append(sorted(component))
+
+    valid_clusters: list[list[int]] = []
+    small_clusters: list[list[int]] = []
+    for component in raw_components:
+        if len(component) >= CLUSTER_MIN_SIZE:
+            valid_clusters.append(component)
+        else:
+            small_clusters.append(component)
+
+    for small in small_clusters:
+        small_tokens: set[str] = set()
+        for idx in small:
+            small_tokens |= set(pages[idx].get("topic_tokens") or set())
+        best_target_idx = None
+        best_overlap = 0
+        for ci, cluster in enumerate(valid_clusters):
+            cluster_tokens: set[str] = set()
+            for idx in cluster:
+                cluster_tokens |= set(pages[idx].get("topic_tokens") or set())
+            overlap = len(small_tokens & cluster_tokens)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_target_idx = ci
+        if best_target_idx is not None and best_overlap >= 2:
+            valid_clusters[best_target_idx].extend(small)
+
+    result: list[dict] = []
+    for ci, component in enumerate(valid_clusters):
+        cluster_pages = [pages[idx] for idx in component]
+        cluster_pages.sort(key=lambda p: p.get("traffic", 0), reverse=True)
+        cluster_pages = cluster_pages[:CLUSTER_MAX_SIZE]
+        if len(cluster_pages) < CLUSTER_MIN_SIZE:
+            continue
+        topic_tokens: set[str] = set()
+        for p in cluster_pages:
+            topic_tokens |= set(p.get("topic_tokens") or set())
+        result.append({
+            "cluster_index": ci,
+            "pages": cluster_pages,
+            "topic_tokens": topic_tokens,
+        })
+
+    logger.info(
+        "  cluster_detect[%s]: detected %d clusters from %d pages",
+        site_name, len(result), n,
+    )
+    return result
+
+
+def _ai_layer1_validate_cluster(cluster_pages: list[dict], site_name: str) -> tuple[list[dict], int]:
+    """AI Layer 1: Validate cluster semantic consistency and prune outlier pages."""
+    if not get_ai_client():
+        return cluster_pages, 50
+
+    try:
+        result = _openai_json_response(
+            system_prompt=(
+                "You are an SEO cluster architect. "
+                "Given a list of pages, determine if they form a coherent topic cluster. "
+                "Remove any outlier pages that clearly do not fit the dominant theme. "
+                "Be conservative: only remove pages that are genuinely unrelated. "
+                "Return JSON with: "
+                "refined_pages (list of URL strings to KEEP), "
+                "removed_pages (list of URL strings to REMOVE), "
+                "consistency_score (integer 0-100)."
+            ),
+            payload={
+                "pages": [
+                    {
+                        "url": p.get("url", ""),
+                        "title": p.get("title", ""),
+                        "primary_keyword": p.get("primary_keyword", ""),
+                        "top_keywords": [kw.get("keyword", "") for kw in (p.get("top_keywords") or [])[:3]],
+                    }
+                    for p in cluster_pages
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.warning("  cluster_validate[%s]: AI Layer 1 failed: %s", site_name, str(exc)[:120])
+        return cluster_pages, 50
+
+    refined_urls = set(result.get("refined_pages") or [])
+    consistency = int(result.get("consistency_score") or 50)
+    if not refined_urls:
+        return cluster_pages, consistency
+
+    refined = [p for p in cluster_pages if p.get("url", "") in refined_urls]
+    removed_count = len(cluster_pages) - len(refined)
+    if removed_count > 0:
+        logger.info(
+            "  cluster_validate[%s]: AI removed %d outliers, consistency=%d",
+            site_name, removed_count, consistency,
+        )
+    return refined if len(refined) >= CLUSTER_MIN_SIZE else cluster_pages, consistency
+
+
+def _assign_pillar_and_supporting(cluster_pages: list[dict]) -> tuple[dict, list[dict]]:
+    """Select pillar page by weighted scoring; all others are supporting."""
+    if not cluster_pages:
+        return {}, []
+
+    max_traffic = max((p.get("traffic") or 0) for p in cluster_pages) or 1
+    max_keywords = max(len(p.get("top_keywords") or []) for p in cluster_pages) or 1
+
+    def _pillar_score(page: dict) -> float:
+        traffic_score = (page.get("traffic") or 0) / max_traffic
+        best_pos = 50
+        for kw in (page.get("top_keywords") or []):
+            pos = kw.get("position") or 50
+            if pos < best_pos:
+                best_pos = pos
+        position_score = max(0.0, 1.0 - (best_pos / 50.0))
+        breadth_score = len(page.get("top_keywords") or []) / max_keywords
+        return 0.4 * traffic_score + 0.3 * position_score + 0.3 * breadth_score
+
+    scored = sorted(cluster_pages, key=_pillar_score, reverse=True)
+    pillar = scored[0]
+    supporting = scored[1:]
+    return pillar, supporting
+
+
+def _ai_layer2_normalize_topic(cluster_pages: list[dict], pillar_url: str, site_name: str) -> dict:
+    """AI Layer 2: Generate canonical topic, intent, and cluster reason."""
+    if not get_ai_client():
+        primary_kw = ""
+        for p in cluster_pages:
+            if p.get("url") == pillar_url:
+                primary_kw = p.get("primary_keyword", "")
+                break
+        return {
+            "cluster_topic": primary_kw or "Content cluster",
+            "cluster_intent": "informational",
+            "cluster_reason": "",
+        }
+
+    try:
+        result = _openai_json_response(
+            system_prompt=(
+                "You are an SEO strategist. Given a topic cluster of pages with a designated pillar page, "
+                "determine: (1) a canonical topic name (2-5 words, clean and specific), "
+                "(2) the primary user intent (informational, commercial, transactional, or navigational), "
+                "(3) a detailed cluster reason (35-70 words prose) explaining how these pages support each other. "
+                "Return JSON with: cluster_topic, cluster_intent, cluster_reason."
+            ),
+            payload={
+                "pillar_page": pillar_url,
+                "pages": [
+                    {
+                        "url": p.get("url", ""),
+                        "title": p.get("title", ""),
+                        "primary_keyword": p.get("primary_keyword", ""),
+                        "traffic": p.get("traffic", 0),
+                    }
+                    for p in cluster_pages
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.warning("  cluster_normalize[%s]: AI Layer 2 failed: %s", site_name, str(exc)[:120])
+        return {"cluster_topic": "Content cluster", "cluster_intent": "informational", "cluster_reason": ""}
+
+    return {
+        "cluster_topic": (result.get("cluster_topic") or "Content cluster").strip(),
+        "cluster_intent": (result.get("cluster_intent") or "informational").strip(),
+        "cluster_reason": (result.get("cluster_reason") or "").strip(),
+    }
+
+
+def _compute_cluster_hash(page_urls: list[str]) -> str:
+    """Deterministic hash of sorted page URLs for cluster identity."""
+    canonical = "\n".join(sorted(set(url.strip().lower().rstrip("/") for url in page_urls if url.strip())))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_existing_clusters(client, domain: str) -> dict[str, dict]:
+    """Load all existing clusters for a domain from the memory table."""
+    try:
+        resp = client.table("internal_linking_clusters").select("*").eq("domain", domain).execute()
+        rows = resp.data or []
+    except Exception:
+        return {}
+    return {row["cluster_hash"]: row for row in rows}
+
+
+def _load_link_history(client, domain: str) -> set[tuple[str, str]]:
+    """Load existing link pairs from history to avoid duplicates."""
+    try:
+        resp = (
+            client.table("internal_linking_history")
+            .select("source_url,target_url")
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception:
+        return set()
+    return {(_normalize_url(r["source_url"]), _normalize_url(r["target_url"])) for r in rows}
+
+
+def _process_cluster_lifecycle(
+    cluster_pages: list[dict],
+    domain: str,
+    site_name: str,
+    existing_clusters: dict[str, dict],
+) -> dict | None:
+    """Check cluster memory; return enriched cluster data or None to skip."""
+    page_urls = [p.get("url", "") for p in cluster_pages if p.get("url")]
+    cluster_hash = _compute_cluster_hash(page_urls)
+
+    if cluster_hash in existing_clusters:
+        cached = existing_clusters[cluster_hash]
+        logger.info(
+            "  cluster_lifecycle[%s]: CACHE HIT hash=%s, cluster_id=%s — skipping AI",
+            site_name, cluster_hash[:8], cached.get("cluster_id"),
+        )
+        return {
+            "cluster_id": cached["cluster_id"],
+            "cluster_hash": cluster_hash,
+            "pillar_page": cached["pillar_page"],
+            "supporting_pages": cached.get("supporting_pages") or [],
+            "cluster_topic": cached.get("cluster_topic") or "Content cluster",
+            "cluster_intent": cached.get("cluster_intent") or "informational",
+            "cluster_reason": cached.get("cluster_reason") or "",
+            "pages": cluster_pages,
+            "is_cached": True,
+        }
+
+    # New cluster: assign pillar
+    pillar, supporting = _assign_pillar_and_supporting(cluster_pages)
+    pillar_url = pillar.get("url", "")
+    supporting_urls = [p.get("url", "") for p in supporting]
+
+    # AI Layer 2: normalize topic
+    normalized = _ai_layer2_normalize_topic(cluster_pages, pillar_url, site_name)
+
+    cluster_id = f"{domain.lower()}-{cluster_hash[:8]}"
+    logger.info(
+        "  cluster_lifecycle[%s]: NEW cluster_id=%s, pillar=%s, %d supporting, topic='%s'",
+        site_name, cluster_id, pillar_url[:60], len(supporting_urls), normalized["cluster_topic"],
+    )
+
+    return {
+        "cluster_id": cluster_id,
+        "cluster_hash": cluster_hash,
+        "pillar_page": pillar_url,
+        "supporting_pages": supporting_urls,
+        "cluster_topic": normalized["cluster_topic"],
+        "cluster_intent": normalized["cluster_intent"],
+        "cluster_reason": normalized["cluster_reason"],
+        "pages": cluster_pages,
+        "is_cached": False,
+    }
+
+
+def _ai_layer3_generate_links_batch(
+    links_to_generate: list[dict],
+    cluster_topic: str,
+    site_name: str,
+) -> list[dict]:
+    """AI Layer 3: Generate anchor text for a batch of links within one cluster."""
+    if not links_to_generate:
+        return []
+    if not get_ai_client():
+        return [
+            {**link, "anchor_text": link.get("target_keyword") or cluster_topic, "confidence": 60}
+            for link in links_to_generate
+        ]
+
+    try:
+        result = _openai_json_response(
+            system_prompt=(
+                f"You are an internal linking specialist for the topic cluster '{cluster_topic}'. "
+                "For each link in the batch, suggest a natural, descriptive anchor text that fits "
+                "naturally in the source page's content. Also provide a brief reason (1-2 sentences) "
+                "and a confidence score (0-100). "
+                "Return JSON with: suggestions (array of objects with source_url, target_url, "
+                "anchor_text, reason, confidence)."
+            ),
+            payload={
+                "cluster_topic": cluster_topic,
+                "links": [
+                    {
+                        "source_url": link["source_url"],
+                        "source_title": link.get("source_title", ""),
+                        "target_url": link["target_url"],
+                        "target_title": link.get("target_title", ""),
+                        "target_keyword": link.get("target_keyword", ""),
+                        "link_type": link["link_type"],
+                    }
+                    for link in links_to_generate
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.warning("  layer3[%s]: AI batch generation failed: %s", site_name, str(exc)[:120])
+        return [
+            {**link, "anchor_text": link.get("target_keyword") or cluster_topic, "confidence": None}
+            for link in links_to_generate
+        ]
+
+    suggestions = result.get("suggestions") or []
+    ai_lookup = {}
+    for s in suggestions:
+        key = (_normalize_url(s.get("source_url", "")), _normalize_url(s.get("target_url", "")))
+        ai_lookup[key] = s
+
+    enriched = []
+    for link in links_to_generate:
+        key = (_normalize_url(link["source_url"]), _normalize_url(link["target_url"]))
+        ai_data = ai_lookup.get(key, {})
+        enriched.append({
+            **link,
+            "anchor_text": (ai_data.get("anchor_text") or link.get("target_keyword") or cluster_topic).strip(),
+            "reason": (ai_data.get("reason") or "").strip(),
+            "confidence": _coerce_confidence(ai_data.get("confidence")),
+        })
+    return enriched
+
+
+def _ai_layer4_validate_links(
+    links: list[dict],
+    cluster_topic: str,
+    site_name: str,
+) -> list[dict]:
+    """AI Layer 4: Skeptical editor validates link quality and rejects weak ones."""
+    if not links:
+        return []
+    if not get_ai_client():
+        return links
+
+    try:
+        result = _openai_json_response(
+            system_prompt=(
+                "You are a skeptical SEO editor reviewing internal link suggestions. "
+                "For each link, score relevance (0-100), contextual fit (0-100), and anchor quality (0-100). "
+                "Reject if: overall confidence < 75, anchor is too generic, or the anchor duplicates another in the batch. "
+                "Approve only links with clear editorial value. "
+                "Return JSON with: results (array of objects with source_url, target_url, approved (boolean), "
+                "overall_confidence (0-100), reason (1 sentence))."
+            ),
+            payload={
+                "cluster_topic": cluster_topic,
+                "links_to_review": [
+                    {
+                        "source_url": link["source_url"],
+                        "target_url": link["target_url"],
+                        "link_type": link["link_type"],
+                        "anchor_text": link.get("anchor_text", ""),
+                        "reason": link.get("reason", ""),
+                    }
+                    for link in links
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.warning("  layer4[%s]: AI validation failed: %s", site_name, str(exc)[:120])
+        return links
+
+    validation_results = result.get("results") or []
+    val_lookup = {}
+    for v in validation_results:
+        key = (_normalize_url(v.get("source_url", "")), _normalize_url(v.get("target_url", "")))
+        val_lookup[key] = v
+
+    validated = []
+    for link in links:
+        key = (_normalize_url(link["source_url"]), _normalize_url(link["target_url"]))
+        val = val_lookup.get(key, {})
+        confidence = _coerce_confidence(val.get("overall_confidence")) or link.get("confidence")
+        approved = val.get("approved", True)
+        is_mandatory = link["link_type"] in ("support_to_pillar", "pillar_to_support")
+
+        if is_mandatory:
+            link["confidence"] = confidence
+            if val.get("reason"):
+                link["reason"] = val["reason"]
+            validated.append(link)
+        elif approved and confidence is not None and confidence >= 75:
+            link["confidence"] = confidence
+            if val.get("reason"):
+                link["reason"] = val["reason"]
+            validated.append(link)
+
+    return validated
+
+
+def _generate_structured_links(
+    cluster_data: dict,
+    page_map: dict[str, dict],
+    existing_pairs: set[tuple[str, str]],
+    link_history_pairs: set[tuple[str, str]],
+    site_name: str,
+) -> list[dict]:
+    """Generate structured links within a single cluster following pillar/spoke rules."""
+    cluster_id = cluster_data["cluster_id"]
+    cluster_topic = cluster_data["cluster_topic"]
+    pillar_url = cluster_data["pillar_page"]
+    supporting_urls = cluster_data["supporting_pages"]
+    pillar_profile = page_map.get(pillar_url, {})
+    all_links: list[dict] = []
+
+    def _should_skip(source: str, target: str) -> bool:
+        s, t = _normalize_url(source), _normalize_url(target)
+        if not s or not t or s == t:
+            return True
+        if (s, t) in existing_pairs or (s, t) in link_history_pairs:
+            return True
+        return False
+
+    def _make_link_request(source_url: str, target_url: str, link_type: str) -> dict:
+        source_profile = page_map.get(source_url, {})
+        target_profile = page_map.get(target_url, {})
+        return {
+            "source_url": source_url,
+            "target_url": target_url,
+            "link_type": link_type,
+            "source_title": source_profile.get("title") or _infer_page_title(source_url),
+            "target_title": target_profile.get("title") or _infer_page_title(target_url),
+            "target_keyword": target_profile.get("primary_keyword") or "",
+        }
+
+    # 1. MANDATORY: Supporting -> Pillar
+    s2p_requests = []
+    for sup_url in supporting_urls:
+        if not _should_skip(sup_url, pillar_url):
+            s2p_requests.append(_make_link_request(sup_url, pillar_url, "support_to_pillar"))
+    if s2p_requests:
+        s2p_links = _ai_layer3_generate_links_batch(s2p_requests, cluster_topic, site_name)
+        all_links.extend(s2p_links)
+
+    # 2. MANDATORY: Pillar -> Supporting
+    p2s_requests = []
+    for sup_url in supporting_urls:
+        if not _should_skip(pillar_url, sup_url):
+            p2s_requests.append(_make_link_request(pillar_url, sup_url, "pillar_to_support"))
+    if p2s_requests:
+        p2s_links = _ai_layer3_generate_links_batch(p2s_requests, cluster_topic, site_name)
+        all_links.extend(p2s_links)
+
+    # 3. OPTIONAL: Supporting <-> Supporting (only if topic token overlap >= 3)
+    s2s_requests = []
+    for i, url_a in enumerate(supporting_urls):
+        profile_a = page_map.get(url_a, {})
+        tokens_a = set(profile_a.get("topic_tokens") or set())
+        for url_b in supporting_urls[i + 1:]:
+            profile_b = page_map.get(url_b, {})
+            tokens_b = set(profile_b.get("topic_tokens") or set())
+            if len(tokens_a & tokens_b) >= 3:
+                if not _should_skip(url_a, url_b):
+                    s2s_requests.append(_make_link_request(url_a, url_b, "support_to_support"))
+                if not _should_skip(url_b, url_a):
+                    s2s_requests.append(_make_link_request(url_b, url_a, "support_to_support"))
+    if s2s_requests:
+        s2s_links = _ai_layer3_generate_links_batch(s2s_requests, cluster_topic, site_name)
+        all_links.extend(s2s_links)
+
+    # Layer 4: Validate all links
+    validated = _ai_layer4_validate_links(all_links, cluster_topic, site_name)
+
+    logger.info(
+        "  structured_links[%s][%s]: %d generated, %d validated (s2p=%d, p2s=%d, s2s=%d)",
+        site_name, cluster_id,
+        len(all_links), len(validated),
+        len([l for l in validated if l["link_type"] == "support_to_pillar"]),
+        len([l for l in validated if l["link_type"] == "pillar_to_support"]),
+        len([l for l in validated if l["link_type"] == "support_to_support"]),
+    )
+    return validated
+
+
 def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: int = 30) -> list[dict]:
-    """Build AI-validated internal-link suggestions for one website."""
+    """Build cluster-first internal-link suggestions for one website (v2 engine)."""
     organic_keywords = site_data.get("organic_keywords")
     top_pages = site_data.get("top_pages")
     internal_links = site_data.get("internal_links")
@@ -1677,41 +2233,147 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
     targets = _select_target_candidates(organic_keywords, site_name=site_name)
     donors = _select_source_candidates(top_pages, min_traffic=500)
     if site_name == "BusinessABC":
-        pre_target_count = len(targets)
-        pre_donor_count = len(donors)
-        targets = [target for target in targets if "/wiki/" not in (target.get("target_page") or "").lower()]
-        donors = [donor for donor in donors if "/wiki/" not in (donor.get("source_page") or "").lower()]
-        logger.info(
-            "  internal_linking[%s]: applied wiki exclusion (targets %d -> %d, donors %d -> %d)",
-            site_name,
-            pre_target_count,
-            len(targets),
-            pre_donor_count,
-            len(donors),
-        )
+        targets = [t for t in targets if "/wiki/" not in (t.get("target_page") or "").lower()]
+        donors = [d for d in donors if "/wiki/" not in (d.get("source_page") or "").lower()]
     if not targets or not donors:
-        logger.info(
-            "  internal_linking[%s]: no eligible suggestions input (targets=%d, donors=%d, organic_keywords=%d, top_pages=%d, internal_links=%d)",
-            site_name,
-            len(targets),
-            len(donors),
-            len((organic_keywords or {}).get("keywords", [])),
-            len((top_pages or {}).get("pages", [])),
-            len((internal_links or {}).get("internal_links", [])),
-        )
+        logger.info("  internal_linking[%s]: no eligible pages (targets=%d, donors=%d)", site_name, len(targets), len(donors))
+        return []
+
     existing_pairs = _build_existing_link_pairs(internal_links)
     page_map = _build_page_enrichment(site_name, site_data)
-    return _generate_ai_suggestions_for_scope(
-        source_site=site_name,
-        target_site=site_name,
-        targets=targets,
-        donors=donors,
-        source_page_map=page_map,
-        target_page_map=page_map,
-        scope="within_site",
-        limit=limit,
-        existing_pairs=existing_pairs,
+
+    # Build unified enriched page list from page_map
+    enriched_pages = list(page_map.values())
+    logger.info("  internal_linking[%s]: %d enriched pages available for clustering", site_name, len(enriched_pages))
+
+    # Step 1: Detect clusters (heuristic)
+    cluster_candidates = _detect_topic_clusters(enriched_pages, site_name)
+    if not cluster_candidates:
+        logger.info("  internal_linking[%s]: no clusters detected, skipping", site_name)
+        return []
+
+    # Load memory tables (graceful if tables don't exist yet)
+    try:
+        from supabase import create_client
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        existing_clusters = _load_existing_clusters(client, site_name)
+        link_history_pairs = _load_link_history(client, site_name)
+    except Exception:
+        existing_clusters = {}
+        link_history_pairs = set()
+        client = None
+
+    all_suggestions: list[dict] = []
+    new_clusters_to_save: list[dict] = []
+    new_history_links: list[dict] = []
+
+    for candidate in cluster_candidates:
+        cluster_pages = candidate["pages"]
+
+        # Step 2: AI Layer 1 — Semantic Validation
+        refined_pages, consistency_score = _ai_layer1_validate_cluster(cluster_pages, site_name)
+        if len(refined_pages) < CLUSTER_MIN_SIZE:
+            continue
+
+        # Step 3: Lifecycle — check memory or create new cluster
+        cluster_data = _process_cluster_lifecycle(refined_pages, site_name, site_name, existing_clusters)
+        if cluster_data is None:
+            continue
+
+        # Step 4: Generate structured links within cluster
+        validated_links = _generate_structured_links(
+            cluster_data=cluster_data,
+            page_map=page_map,
+            existing_pairs=existing_pairs,
+            link_history_pairs=link_history_pairs,
+            site_name=site_name,
+        )
+
+        # Convert validated links to suggestion row format
+        for link in validated_links:
+            source_url = _normalize_url(link["source_url"])
+            target_url = _normalize_url(link["target_url"])
+            source_profile = page_map.get(source_url, {})
+            target_profile = page_map.get(target_url, {})
+            score = int(
+                ((source_profile.get("traffic") or 0) / 100)
+                + (100 - (target_profile.get("top_keywords", [{}])[0].get("position", 50) if target_profile.get("top_keywords") else 50))
+                + ((target_profile.get("top_keywords", [{}])[0].get("volume", 0) if target_profile.get("top_keywords") else 0) / 1000)
+            )
+            all_suggestions.append({
+                "website": site_name,
+                "source_website": site_name,
+                "target_website": site_name,
+                "suggestion_scope": "within_site",
+                "source_page": source_url,
+                "source_page_traffic": source_profile.get("traffic") or 0,
+                "target_page": target_url,
+                "target_page_keyword": target_profile.get("primary_keyword") or link.get("target_keyword", ""),
+                "target_page_position": (target_profile.get("top_keywords", [{}])[0].get("position") if target_profile.get("top_keywords") else None),
+                "target_page_volume": (target_profile.get("top_keywords", [{}])[0].get("volume") if target_profile.get("top_keywords") else None),
+                "suggested_anchor": link.get("anchor_text", ""),
+                "existing_link": False,
+                "score": score,
+                "status": "pending",
+                "reason": link.get("reason", ""),
+                "ai_confidence": link.get("confidence"),
+                "link_type": link["link_type"],
+                "cluster_id": cluster_data["cluster_id"],
+                "pillar_page": cluster_data["pillar_page"],
+                "cluster_topic": cluster_data["cluster_topic"],
+                "cluster_reason": cluster_data.get("cluster_reason", ""),
+            })
+            # Track for history
+            new_history_links.append({
+                "source_url": source_url,
+                "target_url": target_url,
+                "link_type": link["link_type"],
+                "cluster_id": cluster_data["cluster_id"],
+                "anchor_text": link.get("anchor_text", ""),
+                "ai_confidence": link.get("confidence"),
+            })
+            # Add to existing_pairs to prevent duplicates within same run
+            existing_pairs.add((source_url, target_url))
+
+        # Track cluster for memory save
+        if not cluster_data.get("is_cached"):
+            avg_traffic = sum(p.get("traffic", 0) for p in refined_pages) / max(len(refined_pages), 1)
+            new_clusters_to_save.append({
+                "cluster_id": cluster_data["cluster_id"],
+                "domain": site_name,
+                "cluster_topic": cluster_data["cluster_topic"],
+                "cluster_intent": cluster_data.get("cluster_intent", "informational"),
+                "pillar_page": cluster_data["pillar_page"],
+                "supporting_pages": cluster_data["supporting_pages"],
+                "cluster_hash": cluster_data["cluster_hash"],
+                "cluster_status": "new",
+                "cluster_reason": cluster_data.get("cluster_reason", ""),
+                "baseline_metrics": json.dumps({"avg_traffic": round(avg_traffic, 1), "page_count": len(refined_pages)}),
+            })
+
+    # Persist memory tables
+    if client:
+        try:
+            if new_clusters_to_save:
+                for cluster_row in new_clusters_to_save:
+                    cluster_row["supporting_pages"] = json.dumps(cluster_row["supporting_pages"])
+                batch_upsert(client, "internal_linking_clusters", new_clusters_to_save, "cluster_id")
+                logger.info("  memory[%s]: saved %d new clusters", site_name, len(new_clusters_to_save))
+            if new_history_links:
+                for hl in new_history_links:
+                    hl.setdefault("link_applied", False)
+                batch_upsert(client, "internal_linking_history", new_history_links, "source_url,target_url")
+                logger.info("  memory[%s]: saved %d link history entries", site_name, len(new_history_links))
+        except Exception as exc:
+            logger.warning("  memory[%s]: failed to persist memory tables: %s", site_name, str(exc)[:120])
+
+    all_suggestions.sort(
+        key=lambda row: (row["score"], row.get("ai_confidence") or 0, row["source_page_traffic"]),
+        reverse=True,
     )
+    logger.info("  internal_linking[%s]: v2 engine produced %d suggestions (cap %d)", site_name, len(all_suggestions), limit)
+    return all_suggestions[:limit]
+
 
 
 def generate_cross_platform_link_suggestions(parsed_data: dict, limit_per_source: int = 30) -> list[dict]:
@@ -2164,7 +2826,29 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     internal_links_has_reason = _supports_column(client, "internal_linking_suggestions", "reason")
     internal_links_has_ai_confidence = _supports_column(client, "internal_linking_suggestions", "ai_confidence")
     internal_links_has_cluster_reason = _supports_column(client, "internal_linking_suggestions", "cluster_reason")
+    internal_links_has_link_type = _supports_column(client, "internal_linking_suggestions", "link_type")
+    internal_links_has_cluster_id = _supports_column(client, "internal_linking_suggestions", "cluster_id")
+    internal_links_has_pillar_page = _supports_column(client, "internal_linking_suggestions", "pillar_page")
+    internal_links_has_cluster_topic = _supports_column(client, "internal_linking_suggestions", "cluster_topic")
     websites_in_run = sorted(parsed_data.keys())
+
+    def _strip_unsupported_columns(rows: list[dict]) -> None:
+        """Remove columns that the DB doesn't support yet."""
+        for row in rows:
+            if not internal_links_has_reason:
+                row.pop("reason", None)
+            if not internal_links_has_ai_confidence:
+                row.pop("ai_confidence", None)
+            if not internal_links_has_cluster_reason:
+                row.pop("cluster_reason", None)
+            if not internal_links_has_link_type:
+                row.pop("link_type", None)
+            if not internal_links_has_cluster_id:
+                row.pop("cluster_id", None)
+            if not internal_links_has_pillar_page:
+                row.pop("pillar_page", None)
+            if not internal_links_has_cluster_topic:
+                row.pop("cluster_topic", None)
 
     if internal_linking_only:
         logger.info("  internal_linking_only mode: rebuilding internal_linking_suggestions only")
@@ -2178,17 +2862,11 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
                 logger.info("  internal_linking[%s]: skipped (missing one of organic keywords, top pages, or internal links)", ws)
                 continue
             suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
-        suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+        cross_platform_rows = generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30)
         if internal_links_has_cluster_reason:
-            populate_internal_link_cluster_reasons(suggestion_rows)
-        if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
-            for row in suggestion_rows:
-                if not internal_links_has_reason:
-                    row.pop("reason", None)
-                if not internal_links_has_ai_confidence:
-                    row.pop("ai_confidence", None)
-                if not internal_links_has_cluster_reason:
-                    row.pop("cluster_reason", None)
+            populate_internal_link_cluster_reasons(cross_platform_rows)
+        suggestion_rows.extend(cross_platform_rows)
+        _strip_unsupported_columns(suggestion_rows)
         c = batch_upsert(
             client,
             "internal_linking_suggestions",
@@ -2403,17 +3081,11 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     suggestion_rows = []
     for ws, data in parsed_data.items():
         suggestion_rows.extend(generate_internal_link_suggestions(ws, data, limit=30))
-    suggestion_rows.extend(generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30))
+    cross_platform_rows = generate_cross_platform_link_suggestions(parsed_data, limit_per_source=30)
     if internal_links_has_cluster_reason:
-        populate_internal_link_cluster_reasons(suggestion_rows)
-    if not internal_links_has_reason or not internal_links_has_ai_confidence or not internal_links_has_cluster_reason:
-        for row in suggestion_rows:
-            if not internal_links_has_reason:
-                row.pop("reason", None)
-            if not internal_links_has_ai_confidence:
-                row.pop("ai_confidence", None)
-            if not internal_links_has_cluster_reason:
-                row.pop("cluster_reason", None)
+        populate_internal_link_cluster_reasons(cross_platform_rows)
+    suggestion_rows.extend(cross_platform_rows)
+    _strip_unsupported_columns(suggestion_rows)
     c = batch_upsert(
         client,
         "internal_linking_suggestions",

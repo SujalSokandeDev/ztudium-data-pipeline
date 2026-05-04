@@ -30,7 +30,7 @@ permissions:
 jobs:
   process-internal-linking:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repo

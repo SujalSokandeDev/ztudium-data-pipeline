@@ -26,7 +26,7 @@ logger = logging.getLogger("ai_client")
 
 # ── Constants ───────────────────────────────────────────────
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_MODEL = "gemini-3.1-pro"
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 # Map OpenAI model names → Gemini equivalents
 _MODEL_MAP = {

@@ -686,17 +686,19 @@ INSIGHT CATEGORIES (use exactly these):
 - "ai_visibility" — AI citation changes, viral content detection
 
 RESPOND WITH VALID JSON ONLY. No markdown, no code fences. Format:
-[
-  {
-    "category": "urgent|momentum|backlink|content_gap|ai_visibility",
-    "severity": "high|medium|low",
-    "title": "Short headline (max 12 words)",
-    "analysis": "2-4 sentences with SPECIFIC numbers, keywords, and pages from the data",
-    "action": "Concrete action with specific targets, timelines, and deliverables",
-    "impact": "Quantified expected outcome using actual metric values from data",
-    "related_website": "WebsiteName or 'all'"
-  }
-]
+{
+  "insights": [
+    {
+      "category": "urgent|momentum|backlink|content_gap|ai_visibility",
+      "severity": "high|medium|low",
+      "title": "Short headline (max 12 words)",
+      "analysis": "2-4 sentences with SPECIFIC numbers, keywords, and pages from the data",
+      "action": "Concrete action with specific targets, timelines, and deliverables",
+      "impact": "Quantified expected outcome using actual metric values from data",
+      "related_website": "WebsiteName or 'all'"
+    }
+  ]
+}
 
 RULES:
 - Generate 4-6 insights, ordered by severity (high first)
@@ -723,6 +725,7 @@ def generate_insights(context):
                 model="gpt-4o",
                 temperature=0.3,
                 max_tokens=3000,
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": (
@@ -745,15 +748,24 @@ def generate_insights(context):
             raw = raw[4:].strip()
 
         # Attempt to auto-close truncated JSON arrays/objects
-        if raw and not raw.endswith("]") and not raw.endswith("}"):
+        if raw and not raw.endswith("}") and not raw.endswith("]"):
             raw = raw.rstrip(", ")
-            if raw.startswith("["):
-                raw += "}]" if "{" in raw[raw.rfind("},"):] else "]"
-            elif raw.startswith("{"):
-                raw += "}"
+            raw += "}]}"
+
+        # Clean trailing commas
+        raw = re.sub(r",(\s*[\]}])", r"\1", raw)
 
         try:
-            insights = json.loads(raw)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                if "insights" in parsed and isinstance(parsed["insights"], list):
+                    insights = parsed["insights"]
+                else:
+                    # Fallback: take the first list found in the dict
+                    insights = next((v for v in parsed.values() if isinstance(v, list)), [])
+            else:
+                insights = parsed
+            
             if not isinstance(insights, list):
                 insights = [insights]
         except json.JSONDecodeError as e:
@@ -1124,7 +1136,7 @@ def generate_content_plan(context):
         with Spinner("Building keyword clusters"):
             response = ai_chat_completion(
                 model="gpt-4o",
-                temperature=0.4,
+                temperature=0.1,
                 max_tokens=16000,
                 response_format={"type": "json_object"},
                 messages=[
@@ -1153,6 +1165,9 @@ def generate_content_plan(context):
         if raw and not raw.endswith("}"):
             raw = raw.rstrip(", ")
             raw += "}]}"
+
+        # Clean trailing commas
+        raw = re.sub(r",(\s*[\]}])", r"\1", raw)
 
         plan = json.loads(raw)
 

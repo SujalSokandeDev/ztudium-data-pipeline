@@ -2045,7 +2045,9 @@ def _ai_layer3_generate_links_batch(
             for link in links_to_generate
         ]
 
-    suggestions = result.get("suggestions") or []
+    suggestions = result.get("suggestions") if isinstance(result, dict) else result
+    if not isinstance(suggestions, list):
+        suggestions = []
     ai_lookup = {}
     for s in suggestions:
         key = (_normalize_url(s.get("source_url", "")), _normalize_url(s.get("target_url", "")))
@@ -2103,7 +2105,9 @@ def _ai_layer4_validate_links(
         logger.warning("  layer4[%s]: AI validation failed: %s", site_name, str(exc)[:120])
         return links
 
-    validation_results = result.get("results") or []
+    validation_results = result.get("results") if isinstance(result, dict) else result
+    if not isinstance(validation_results, list):
+        validation_results = []
     val_lookup = {}
     for v in validation_results:
         key = (_normalize_url(v.get("source_url", "")), _normalize_url(v.get("target_url", "")))

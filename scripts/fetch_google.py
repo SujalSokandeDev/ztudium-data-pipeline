@@ -785,12 +785,13 @@ def main():
         
         # Track pipeline_runs completion
         if pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
-            from supabase import create_client
+            from supabase import create_client as _pr_create_client
             try:
-                client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-                client.table("pipeline_runs").update({
-                    "status": "completed" if status == "completed" else "failed",
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                _pr_client = _pr_create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                from datetime import datetime as _dt, timezone as _tz
+                _pr_client.table("pipeline_runs").update({
+                    "status": "completed" if status in ("success", "partial") else "failed",
+                    "completed_at": _dt.now(_tz.utc).isoformat(),
                     "details": {"duration_seconds": duration_seconds}
                 }).eq("id", pipeline_run_id).execute()
             except Exception as e:

@@ -628,6 +628,21 @@ def main():
     all_website_names = [ws["name"] for ws in WEBSITES]
     run_id = _start_ingestion_run("google", all_website_names)
 
+    # Track in pipeline_runs
+    pipeline_run_id = None
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        from supabase import create_client
+        try:
+            client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            res = client.table("pipeline_runs").insert({
+                "pipeline": "google",
+                "status": "running"
+            }).execute()
+            if res.data and len(res.data) > 0:
+                pipeline_run_id = res.data[0]["id"]
+        except Exception as e:
+            logger.warning("Could not track pipeline_run start: %s", str(e)[:200])
+
     all_data = {}
     keywords_data = {}
     pages_data = {}
@@ -767,6 +782,19 @@ def main():
             error_details=error_details,
             duration_seconds=duration_seconds,
         )
+        
+        # Track pipeline_runs completion
+        if pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            from supabase import create_client
+            try:
+                client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                client.table("pipeline_runs").update({
+                    "status": "completed" if status == "completed" else "failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "details": {"duration_seconds": duration_seconds}
+                }).eq("id", pipeline_run_id).execute()
+            except Exception as e:
+                logger.warning("Could not track pipeline_run completion: %s", str(e)[:200])
 
     # Summary
     print("\n" + "=" * 60)

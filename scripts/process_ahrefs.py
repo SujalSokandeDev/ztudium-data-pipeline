@@ -3190,6 +3190,21 @@ def main():
     websites_attempted = sorted(parsed_data.keys())
     run_id = _start_ingestion_run("ahrefs", websites_attempted)
 
+    # Track in pipeline_runs
+    pipeline_run_id = None
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        from supabase import create_client as _pr_create_client
+        try:
+            _pr_client = _pr_create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            res = _pr_client.table("pipeline_runs").insert({
+                "pipeline": "ahrefs",
+                "status": "running"
+            }).execute()
+            if res.data and len(res.data) > 0:
+                pipeline_run_id = res.data[0]["id"]
+        except Exception as e:
+            logger.warning("Could not track pipeline_run start: %s", str(e)[:200])
+
     # Upload to Supabase
     print("\n--- Uploading to Supabase ---")
     status = "success"
@@ -3220,6 +3235,20 @@ def main():
             error_details=parse_errors,
             duration_seconds=duration_seconds,
         )
+
+        # Track pipeline_runs completion
+        if pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            from supabase import create_client as _pr_create_client2
+            try:
+                _pr_client2 = _pr_create_client2(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                from datetime import datetime as _dt, timezone as _tz
+                _pr_client2.table("pipeline_runs").update({
+                    "status": "completed" if status in ("success", "partial") else "failed",
+                    "completed_at": _dt.now(_tz.utc).isoformat(),
+                    "details": {"duration_seconds": duration_seconds}
+                }).eq("id", pipeline_run_id).execute()
+            except Exception as e:
+                logger.warning("Could not track pipeline_run completion: %s", str(e)[:200])
 
     print("\n✅ Done!")
 

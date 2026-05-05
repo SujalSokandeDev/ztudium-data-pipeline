@@ -750,6 +750,10 @@ def generate_insights(context):
         # Attempt to auto-close truncated JSON arrays/objects
         if raw and not raw.endswith("}") and not raw.endswith("]"):
             raw = raw.rstrip(", ")
+            # If the string ends with an unclosed quote, close it first
+            if raw.count('"') % 2 != 0:
+                # If it ends with an escaped quote \", it's trickier, but usually it's just cut off
+                raw += '"'
             raw += "}]}"
 
         # Clean trailing commas

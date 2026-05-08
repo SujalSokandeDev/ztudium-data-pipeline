@@ -12,7 +12,7 @@ permissions:
 jobs:
   weekly-insights:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

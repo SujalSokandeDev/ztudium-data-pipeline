@@ -21,6 +21,7 @@ import time
 import logging
 import glob
 import requests
+import argparse
 from datetime import date
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -278,6 +279,10 @@ def trigger_github_action():
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(description="Upload Ahrefs CSV/TXT exports to Supabase Storage")
+    parser.add_argument("--skip-trigger", action="store_true", help="Do not trigger the GitHub Actions processing workflow after upload")
+    args = parser.parse_args()
+
     print()
     print("=" * 60)
     print("  AHREFS CSV → SUPABASE STORAGE → GITHUB ACTION")
@@ -308,9 +313,12 @@ def main():
     success = upload_to_supabase_storage(export_dir)
 
     # Step 3: Trigger processing
-    if success:
+    if success and not args.skip_trigger and os.getenv("SKIP_GITHUB_TRIGGER", "").lower() not in {"1", "true", "yes"}:
         print()
         trigger_github_action()
+    elif success:
+        logger.info("")
+        logger.info("GitHub Action trigger skipped for this local run.")
 
     print()
     print("✅ Done!" if success else "⚠️ Done with errors — check logs above")

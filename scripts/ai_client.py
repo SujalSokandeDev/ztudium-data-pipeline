@@ -19,6 +19,8 @@ Usage:
 import json
 import logging
 import os
+import time
+from datetime import datetime
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -27,6 +29,8 @@ logger = logging.getLogger("ai_client")
 # ── Constants ───────────────────────────────────────────────
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GEMINI_MODEL = "gemini-3.1-pro-preview"
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-pro")
+OPENAI_SAFETY_MODEL = os.getenv("OPENAI_SAFETY_MODEL", "gpt-4o")
 
 # Map OpenAI model names → Gemini equivalents
 _MODEL_MAP = {
@@ -68,13 +72,14 @@ def _init_clients():
     gemini_key = os.getenv("GEMINI_API_KEY", "")
 
     if openai_key and _openai_client is None:
-        _openai_client = OpenAI(api_key=openai_key)
+        _openai_client = OpenAI(api_key=openai_key, timeout=90.0)
         logger.debug("OpenAI client initialised")
 
     if gemini_key and _gemini_client is None:
         _gemini_client = OpenAI(
             api_key=gemini_key,
             base_url=GEMINI_BASE_URL,
+            timeout=90.0,
         )
         logger.debug("Gemini client initialised (fallback)")
 
@@ -117,8 +122,6 @@ def _is_retryable(exc: Exception) -> bool:
     """Detect transient errors worth retrying on the same provider."""
     msg = str(exc).lower()
     retry_markers = (
-        "timed out",
-        "timeout",
         "connection reset",
         "temporarily unavailable",
         "503",
@@ -127,6 +130,36 @@ def _is_retryable(exc: Exception) -> bool:
         "overloaded",
     )
     return any(marker in msg for marker in retry_markers)
+
+
+def _attach_model_used(response, provider: str, model: str):
+    try:
+        setattr(response, "_ztudium_provider_used", provider)
+        setattr(response, "_ztudium_model_used", model)
+    except Exception:
+        pass
+    return response
+
+
+def response_model_used(response) -> str:
+    return str(getattr(response, "_ztudium_model_used", "") or getattr(response, "model", "") or "unknown")
+
+
+def response_provider_used(response) -> str:
+    return str(getattr(response, "_ztudium_provider_used", "") or "unknown")
+
+
+def _sleep_for_retry(delay: int, provider: str, model: str, attempt: int, exc: Exception):
+    logger.warning(
+        "AI call failed at %s on %s/%s attempt %s: %s",
+        datetime.now().isoformat(timespec="seconds"),
+        provider,
+        model,
+        attempt,
+        str(exc)[:220],
+    )
+    if delay > 0:
+        time.sleep(delay)
 
 
 def _switch_to_gemini(reason: str):
@@ -201,6 +234,72 @@ def ai_chat_completion(*, model: str = "gpt-4o", fallback_model: str | None = No
             _switch_to_gemini(str(exc)[:200])
             return _call(_gemini_client, resolve_target_model(True))
         raise
+
+
+def ai_chat_completion_reliable(
+    *,
+    model: str = "gpt-4o",
+    primary_gemini_model: str | None = None,
+    secondary_gemini_model: str | None = None,
+    openai_fallback_model: str | None = None,
+    **kwargs,
+):
+    """Gemini-first completion chain for insight generation.
+
+    Order:
+    1. Gemini 3.1 Pro Preview, initial attempt + one retry.
+    2. Gemini 2.5 Pro, with exponential backoff.
+    3. OpenAI safety net, preserving the same messages and options.
+    """
+    _init_clients()
+    primary = primary_gemini_model or GEMINI_MODEL
+    secondary = secondary_gemini_model or GEMINI_FALLBACK_MODEL
+    openai_model = openai_fallback_model or OPENAI_SAFETY_MODEL
+    errors = []
+
+    def _call(client, provider: str, target_model: str):
+        response = client.chat.completions.create(model=target_model, **kwargs)
+        return _attach_model_used(response, provider, target_model)
+
+    if _gemini_client:
+        for attempt, delay in enumerate((0, 1), start=1):
+            try:
+                if delay:
+                    time.sleep(delay)
+                return _call(_gemini_client, "gemini", primary)
+            except Exception as exc:
+                errors.append(exc)
+                _sleep_for_retry(0, "gemini", primary, attempt, exc)
+
+        for attempt, delay in enumerate((0, 1, 2, 4), start=1):
+            try:
+                if delay:
+                    time.sleep(delay)
+                return _call(_gemini_client, "gemini", secondary)
+            except Exception as exc:
+                errors.append(exc)
+                if attempt < 4:
+                    _sleep_for_retry(0, "gemini", secondary, attempt, exc)
+                else:
+                    logger.error(
+                        "Gemini fallback exhausted at %s on %s: %s",
+                        datetime.now().isoformat(timespec="seconds"),
+                        secondary,
+                        str(exc)[:220],
+                    )
+
+    if _openai_client:
+        for attempt, delay in enumerate((0, 1), start=1):
+            try:
+                if delay:
+                    time.sleep(delay)
+                return _call(_openai_client, "openai", openai_model)
+            except Exception as exc:
+                errors.append(exc)
+                _sleep_for_retry(0, "openai", openai_model, attempt, exc)
+
+    detail = "; ".join(str(err)[:180] for err in errors[-3:]) or "No configured AI provider."
+    raise RuntimeError(f"All AI model attempts failed: {detail}")
 
 
 def ai_json_response(

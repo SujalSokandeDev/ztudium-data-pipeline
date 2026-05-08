@@ -2623,6 +2623,80 @@ def populate_internal_link_cluster_reasons(rows: list[dict]) -> None:
     logger.info("  internal_linking: generated cluster_reason for %d clusters", generated)
 
 
+def classify_authority_problem(row: dict) -> dict:
+    """Classify the SEO authority issue solved by an internal-link suggestion."""
+    scope = row.get("suggestion_scope") or "within_site"
+    link_type = row.get("link_type") or ""
+    score = int(row.get("score") or 0)
+    source_traffic = int(row.get("source_page_traffic") or 0)
+    position = float(row.get("target_page_position") or 999)
+    keyword = row.get("target_page_keyword") or "the target keyword"
+    target_page = row.get("target_page") or "the target page"
+    source_page = row.get("source_page") or "the source page"
+    cluster_topic = row.get("cluster_topic") or keyword
+
+    if scope == "cross_platform":
+        problem_type = "Cross-Platform Opportunity"
+        reason = (
+            f"{source_page} and {target_page} cover overlapping Ztudium ecosystem topics. "
+            f"A contextual link would transfer topical relevance between properties for '{keyword}'."
+        )
+        priority = "high" if score >= 100 else "medium" if score >= 80 else "low"
+        action = f"Add a cross-platform contextual link using '{keyword}' or a close variant as anchor text."
+    elif link_type == "support_to_pillar":
+        problem_type = "Inverted Cluster"
+        reason = (
+            f"The supporting page should reinforce the pillar for the '{cluster_topic}' cluster. "
+            "Without support-to-pillar links, Google may not identify the main authority hub."
+        )
+        priority = "high" if score >= 90 else "medium"
+        action = f"Link this supporting page back to the pillar page using '{keyword}' as the anchor."
+    elif link_type == "pillar_to_support" and source_traffic >= 500:
+        problem_type = "Authority Hoarding"
+        reason = (
+            f"The source page has meaningful traffic ({source_traffic:,}) but is not distributing authority "
+            f"to {target_page}, which targets '{keyword}'."
+        )
+        priority = "high" if source_traffic >= 2000 or score >= 100 else "medium"
+        action = "Add 3-5 contextual links from this high-authority page to relevant supporting pages."
+    elif 8 <= position <= 15:
+        problem_type = "Link-Starved Page"
+        reason = (
+            f"The target page already ranks on page 1/2 at position {position:g} for '{keyword}', "
+            "so internal authority is likely the fastest lever to push it into the top results."
+        )
+        priority = "high" if score >= 90 else "medium"
+        action = f"Add this link and 2-4 related internal links to push '{keyword}' toward the top 5."
+    elif row.get("cluster_id"):
+        problem_type = "Orphaned Cluster Page"
+        reason = (
+            f"The page belongs to the '{cluster_topic}' cluster but is under-connected to related pages. "
+            "A cluster link helps consolidate topical authority."
+        )
+        priority = "medium" if score >= 70 else "low"
+        action = f"Connect this page inside the '{cluster_topic}' cluster with descriptive anchor text."
+    else:
+        problem_type = "Link-Starved Page"
+        reason = (
+            f"The target page needs more internal authority for '{keyword}'. "
+            "This suggestion connects it from a relevant source page."
+        )
+        priority = "medium" if score >= 70 else "low"
+        action = f"Add a contextual link from the source page to the target page using '{keyword}'."
+
+    return {
+        "authority_problem_type": problem_type,
+        "authority_problem_reason": reason,
+        "authority_priority": priority,
+        "authority_action": action,
+    }
+
+
+def populate_authority_problem_fields(rows: list[dict]) -> None:
+    for row in rows:
+        row.update(classify_authority_problem(row))
+
+
 def batch_upsert(client, table, rows, conflict_cols):
     """Batch upsert with key normalization."""
     if not rows:
@@ -2834,6 +2908,10 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     internal_links_has_cluster_id = _supports_column(client, "internal_linking_suggestions", "cluster_id")
     internal_links_has_pillar_page = _supports_column(client, "internal_linking_suggestions", "pillar_page")
     internal_links_has_cluster_topic = _supports_column(client, "internal_linking_suggestions", "cluster_topic")
+    internal_links_has_authority_problem_type = _supports_column(client, "internal_linking_suggestions", "authority_problem_type")
+    internal_links_has_authority_problem_reason = _supports_column(client, "internal_linking_suggestions", "authority_problem_reason")
+    internal_links_has_authority_priority = _supports_column(client, "internal_linking_suggestions", "authority_priority")
+    internal_links_has_authority_action = _supports_column(client, "internal_linking_suggestions", "authority_action")
     websites_in_run = sorted(parsed_data.keys())
 
     def _strip_unsupported_columns(rows: list[dict]) -> None:
@@ -2853,6 +2931,14 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
                 row.pop("pillar_page", None)
             if not internal_links_has_cluster_topic:
                 row.pop("cluster_topic", None)
+            if not internal_links_has_authority_problem_type:
+                row.pop("authority_problem_type", None)
+            if not internal_links_has_authority_problem_reason:
+                row.pop("authority_problem_reason", None)
+            if not internal_links_has_authority_priority:
+                row.pop("authority_priority", None)
+            if not internal_links_has_authority_action:
+                row.pop("authority_action", None)
 
     if internal_linking_only:
         logger.info("  internal_linking_only mode: rebuilding internal_linking_suggestions only")
@@ -2870,6 +2956,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
         if internal_links_has_cluster_reason:
             populate_internal_link_cluster_reasons(cross_platform_rows)
         suggestion_rows.extend(cross_platform_rows)
+        populate_authority_problem_fields(suggestion_rows)
         _strip_unsupported_columns(suggestion_rows)
         c = batch_upsert(
             client,
@@ -3089,6 +3176,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
     if internal_links_has_cluster_reason:
         populate_internal_link_cluster_reasons(cross_platform_rows)
     suggestion_rows.extend(cross_platform_rows)
+    populate_authority_problem_fields(suggestion_rows)
     _strip_unsupported_columns(suggestion_rows)
     c = batch_upsert(
         client,

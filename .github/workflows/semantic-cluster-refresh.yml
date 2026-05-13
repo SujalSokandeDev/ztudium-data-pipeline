@@ -4,6 +4,11 @@ on:
   schedule:
     # Daily after the normal data refresh window.
     - cron: "45 2 * * *"
+  workflow_run:
+    workflows:
+      - Weekly AI Insights
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       date:
@@ -24,6 +29,7 @@ permissions:
 
 jobs:
   refresh-semantic-clusters:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -32,7 +38,7 @@ jobs:
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       INPUT_DATE: ${{ github.event.inputs.date || '' }}
       INPUT_SITE: ${{ github.event.inputs.site || '' }}
-      INPUT_TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || 'scheduled_refresh' }}
+      INPUT_TRIGGER_SOURCE: ${{ github.event_name == 'workflow_run' && 'weekly_insights_completed' || github.event.inputs.trigger_source || 'scheduled_refresh' }}
 
     steps:
       - name: Checkout repo

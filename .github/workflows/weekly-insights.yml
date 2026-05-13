@@ -4,6 +4,12 @@ on:
   schedule:
     # Run weekly on Sunday at 23:00 UTC
     - cron: '0 23 * * 0'
+  workflow_run:
+    workflows:
+      - Process Ahrefs CSVs
+      - Process Keyword Gap CSVs
+    types:
+      - completed
   workflow_dispatch:
 
 permissions:
@@ -11,6 +17,7 @@ permissions:
 
 jobs:
   weekly-insights:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 

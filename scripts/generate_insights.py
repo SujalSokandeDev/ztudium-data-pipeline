@@ -2103,29 +2103,175 @@ def compute_opportunity_score(volume: int, kd: int) -> float:
     return min(9999.99, round(volume * (1 / (kd + 1)), 1))
 
 
+CLUSTER_MIN_PER_SITE = int(os.getenv("CLUSTER_MIN_PER_SITE", "5"))
+CLUSTER_MAX_PER_SITE = int(os.getenv("CLUSTER_MAX_PER_SITE", "10"))
+
+
+def keyword_cluster_key(keyword: str, cluster_label: str | None = None) -> str:
+    """Create a stable semantic bucket label for deterministic cluster fill-in."""
+    label = clean_text(cluster_label)
+    if label:
+        return sanitize_cluster_label(label, keyword, extract_core_topic(keyword))
+
+    core = extract_core_topic(keyword)
+    words = [w for w in re.split(r"\s+", core.lower()) if len(w) > 2 and w not in CORE_TOPIC_STRIP]
+    if not words:
+        return sanitize_cluster_label(None, keyword, keyword.title())
+    return sanitize_cluster_label(" ".join(words[:3]).title(), keyword, core.title())
+
+
+def keyword_strength(kw: dict) -> float:
+    volume = int(kw.get("volume") or 0)
+    kd = int(kw.get("kd") or 99)
+    opportunity = kw.get("opportunity_score")
+    try:
+        opportunity = float(opportunity) if opportunity is not None else compute_opportunity_score(volume, kd)
+    except (TypeError, ValueError):
+        opportunity = compute_opportunity_score(volume, kd)
+    return opportunity + (volume / 1000) - (kd * 0.75)
+
+
+def build_validated_cluster(site: str, topic: str, keywords: list[dict], relaxed_keys: set[str], fallback_index: int) -> dict | None:
+    """Build one validated cluster from real keyword rows only."""
+    candidates = [kw for kw in keywords if is_valid_keyword(kw.get("keyword"))]
+    if len(candidates) < 2:
+        return None
+
+    candidates = sorted(candidates, key=keyword_strength, reverse=True)
+    primary = candidates[0]
+    related = candidates[1:16]
+    if not related:
+        return None
+
+    primary_keyword = {
+        "keyword": primary.get("keyword"),
+        "volume": int(primary.get("volume") or 0),
+        "kd": int(primary.get("kd") or 0),
+        "intent": primary.get("intent") or "other",
+        "relaxed": primary.get("keyword", "").strip().lower() in relaxed_keys,
+        "opportunity_score": compute_opportunity_score(int(primary.get("volume") or 0), int(primary.get("kd") or 0)),
+    }
+    related_keywords = []
+    for kw in related:
+        related_keywords.append({
+            "keyword": kw.get("keyword"),
+            "volume": int(kw.get("volume") or 0),
+            "kd": int(kw.get("kd") or 0),
+            "intent": kw.get("intent") or "other",
+            "relaxed": kw.get("keyword", "").strip().lower() in relaxed_keys,
+            "opportunity_score": compute_opportunity_score(int(kw.get("volume") or 0), int(kw.get("kd") or 0)),
+        })
+
+    topic = sanitize_cluster_label(topic, primary_keyword["keyword"], extract_core_topic(primary_keyword["keyword"]).title())
+    title = sanitize_hub_title(None, primary_keyword["keyword"], topic)
+    all_volumes = [primary_keyword["volume"]] + [kw["volume"] for kw in related_keywords]
+    all_keywords = [primary_keyword] + related_keywords
+    cluster = {
+        "cluster_topic": topic,
+        "core_topic": sanitize_cluster_label(None, primary_keyword["keyword"], extract_core_topic(primary_keyword["keyword"]).title()),
+        "hub_article_title": title,
+        "primary_keyword": primary_keyword,
+        "related_keywords": related_keywords,
+        "total_cluster_volume": sum(all_volumes),
+        "estimated_traffic": int(sum(all_volumes) * 0.18),
+        "strategy": sanitize_narrative(
+            None,
+            f"Build a focused {site} content cluster around {topic}, using the pillar keyword and supporting spokes to capture validated search demand.",
+        ),
+    }
+    question_keyword = find_question_keyword(all_keywords)
+    if question_keyword:
+        cluster["question_keyword"] = question_keyword
+    relaxed_count = sum(1 for kw in all_keywords if kw.get("relaxed"))
+    if relaxed_count:
+        cluster["relaxed_count"] = relaxed_count
+    cluster["fallback_rank"] = fallback_index
+    return cluster
+
+
+def deterministic_site_clusters(site: str, site_keywords: list[dict], existing_topics: set[str], existing_primary_keys: set[str], strict_keys: set[str]) -> list[dict]:
+    """Fill missing clusters with conservative real-keyword groupings."""
+    if not site_keywords:
+        return []
+
+    ranked = sorted(site_keywords, key=keyword_strength, reverse=True)
+    strong = [kw for kw in ranked if int(kw.get("volume") or 0) >= 500 and int(kw.get("kd") or 99) <= 15]
+    if len(strong) < CLUSTER_MIN_PER_SITE * 2:
+        strong = [kw for kw in ranked if int(kw.get("volume") or 0) >= 200 and int(kw.get("kd") or 99) <= 25]
+    if len(strong) < 2:
+        return []
+    relaxed_keys = {kw.get("keyword", "").strip().lower() for kw in strong if kw.get("keyword", "").strip().lower() not in strict_keys}
+
+    buckets = defaultdict(list)
+    for kw in strong:
+        if kw.get("keyword", "").strip().lower() in existing_primary_keys:
+            continue
+        buckets[keyword_cluster_key(kw.get("keyword"), kw.get("cluster"))].append(kw)
+
+    ordered_buckets = sorted(
+        buckets.items(),
+        key=lambda item: (len(item[1]), max(keyword_strength(kw) for kw in item[1])),
+        reverse=True,
+    )
+
+    clusters = []
+    used_keywords = set(existing_primary_keys)
+    for topic, kws in ordered_buckets:
+        topic_key = topic.lower()
+        if topic_key in existing_topics:
+            continue
+        available = [kw for kw in kws if kw.get("keyword", "").strip().lower() not in used_keywords]
+        cluster = build_validated_cluster(site, topic, available, relaxed_keys, len(clusters) + 1)
+        if not cluster:
+            continue
+        for kw in [cluster["primary_keyword"]] + cluster.get("related_keywords", []):
+            used_keywords.add(kw.get("keyword", "").strip().lower())
+        existing_topics.add(topic_key)
+        clusters.append(cluster)
+        if len(clusters) >= CLUSTER_MAX_PER_SITE:
+            break
+
+    if len(clusters) < CLUSTER_MIN_PER_SITE:
+        remaining = [kw for kw in strong if kw.get("keyword", "").strip().lower() not in used_keywords]
+        while len(clusters) < CLUSTER_MIN_PER_SITE and len(remaining) >= 2:
+            chunk = remaining[: min(10, max(2, len(remaining) // max(1, CLUSTER_MIN_PER_SITE - len(clusters))))]
+            remaining = remaining[len(chunk):]
+            topic = keyword_cluster_key(chunk[0].get("keyword"), None)
+            if topic.lower() in existing_topics:
+                continue
+            cluster = build_validated_cluster(site, topic, chunk, relaxed_keys, len(clusters) + 1)
+            if cluster:
+                clusters.append(cluster)
+                existing_topics.add(topic.lower())
+
+    return clusters[:CLUSTER_MAX_PER_SITE]
+
+
 CLUSTER_PROMPT = """You are an expert SEO content strategist. Analyze the keyword data below and group related keywords into thematic content clusters.
 
 CRITICAL COVERAGE RULE:
 - You MUST generate clusters for EVERY website provided in the data. Do NOT skip any website.
-- Each website MUST have exactly 3 clusters.
+- Each website should have 5 to 10 clusters when enough real keywords are available.
+- Prioritize at least 5 strong, distinct clusters per website before adding more.
 - Each cluster must represent a genuinely DISTINCT topic theme — not variations of the same topic.
 
 KEYWORD VOLUME RULE:
 - Each cluster should have 1 primary keyword (highest volume) + ideally 10 to 20 related keywords
 - IMPORTANT: If a website does not have enough qualifying keywords to fill 10-20, use AS MANY as are available from the data. Do NOT invent keywords.
 - It is acceptable to have clusters with fewer than 10 related keywords if the data is limited.
-- If there are not enough keywords at KD ≤ 5 / Volume ≥ 1000, include keywords with KD up to 10 or Volume down to 500.
+- If there are not enough keywords at KD ≤ 5 / Volume ≥ 1000, include keywords with KD up to 25 or Volume down to 200.
 - NEVER fabricate or invent keywords — only use keywords that appear in the provided data.
 
 STRICT RULES:
 1. ONLY use keywords that appear in the provided data — DO NOT invent or fabricate keywords under any circumstances
-2. PREFER keywords with KD ≤ 5 and Volume ≥ 1000, but include KD ≤ 10 and Volume ≥ 500 when needed
-3. If a website only has 15 total keywords, distribute them across 3 clusters (e.g. 5 per cluster) — do not pad with invented keywords
+2. PREFER keywords with KD ≤ 5 and Volume ≥ 1000, but include KD ≤ 25 and Volume ≥ 200 when needed
+3. If a website only has limited keywords, distribute them across as many distinct clusters as the data supports — do not pad with invented keywords
 4. Hub article title must be optimized to target the ENTIRE cluster, not just the primary keyword
 5. Never use generic titles like "Ultimate Guide to X" — be specific, compelling, and SEO-optimized
 6. Estimate traffic realistically: assume 15-25% CTR for position 1-3 on total cluster volume
 7. DO NOT use non-Latin characters anywhere in cluster topics, titles, or keywords
 8. If a keyword contains Chinese, Cyrillic, Arabic, or other non-Latin characters, discard it instead of using it
+9. Build multi-layer clusters: parent topic, pillar keyword, and spokes that can become supporting articles
 
 RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 
@@ -2159,11 +2305,12 @@ RESPOND WITH VALID JSON ONLY. No markdown, no code fences, no explanation text.
 }
 
 QUALITY REQUIREMENTS:
-- Generate exactly 3 clusters for EVERY website — never skip a website
-- Aim for 10-20 related keywords per cluster, but accept fewer if the data doesn't support it
+- Generate 5-10 clusters for EVERY website when the data supports it — never skip a website that has valid keywords
+- Aim for 6-15 related keywords per cluster, but accept fewer if the data doesn't support it
 - NEVER invent keywords — if you can't find enough real keywords, use fewer
 - Each cluster must target a genuinely different topic area
-- Strategy should mention which competitors rank for these terms"""
+- Avoid repetitive themes across clusters within the same website
+- Strategy should mention why the cluster is a useful content opportunity"""
 
 
 def generate_content_plan(context):
@@ -2207,6 +2354,11 @@ def generate_content_plan(context):
         return None
 
     # ── Step 2: Pre-filter — two tiers for progressive threshold relaxation ──
+    configured_sites = list(SITES)
+    all_keywords_by_site = defaultdict(list)
+    for kw in all_kw_data:
+        all_keywords_by_site[kw.get("website", "unknown")].append(kw)
+
     # Primary pool: strict KD ≤ 5, vol ≥ 1000
     qualifying_strict = [
         kw for kw in all_kw_data
@@ -2220,8 +2372,17 @@ def generate_content_plan(context):
         if kw.get("volume", 0) >= 500 and kw.get("kd", 99) <= 10
     ]
 
-    # Send ALL extended keywords to the model (it needs enough to form 3 × 10-20 clusters)
-    qualifying = qualifying_extended
+    # Fallback pool: enough real keywords for sites that do not have many very easy wins.
+    qualifying_fallback = [
+        kw for kw in all_kw_data
+        if kw.get("volume", 0) >= 200 and kw.get("kd", 99) <= 25
+    ]
+
+    qualifying_by_key = {}
+    for kw in qualifying_extended + qualifying_fallback:
+        key = f"{kw.get('website')}|{kw.get('keyword', '').strip().lower()}"
+        qualifying_by_key[key] = kw
+    qualifying = list(qualifying_by_key.values())
 
     # Count sites in each tier
     strict_sites = set(kw.get("website") for kw in qualifying_strict)
@@ -2230,7 +2391,8 @@ def generate_content_plan(context):
     logger.info(
         f"  Pre-filter: {len(all_kw_data)} total -> "
         f"{len(qualifying_strict)} strict (KD≤5, vol≥1000) across {len(strict_sites)} sites, "
-        f"{len(qualifying)} extended (KD≤10, vol≥500) across {len(all_sites)} sites"
+        f"{len(qualifying_extended)} extended (KD≤10, vol≥500), "
+        f"{len(qualifying)} fallback-ready (KD≤25, vol≥200) across {len(all_sites)} sites"
     )
 
     if len(qualifying) < 3:
@@ -2239,7 +2401,7 @@ def generate_content_plan(context):
 
     # Build lookup for post-validation (includes extended pool for lenient matching)
     kw_lookup = {}
-    for kw in qualifying_extended:  # Use the wider pool for validation
+    for kw in qualifying:  # Use the widest real-keyword pool for validation
         key = kw.get("keyword", "").strip().lower()
         if key:
             kw_lookup[key] = {
@@ -2256,9 +2418,13 @@ def generate_content_plan(context):
     for kw in qualifying:
         by_site[kw.get("website", "unknown")].append(kw)
 
-    for site, kws in sorted(by_site.items()):
+    for site in configured_sites:
+        kws = sorted(by_site.get(site, []), key=keyword_strength, reverse=True)
+        if not kws:
+            logger.info("  No qualifying clustering keywords for %s after progressive thresholds", site)
+            continue
         sections.append(f"\n=== {site} ({len(kws)} qualifying keywords) ===")
-        for kw in kws[:100]:  # Max 100 per site to fill 3 clusters × 10-20 keywords
+        for kw in kws[:140]:  # Enough for 5-10 clusters without overwhelming the model.
             comp_str = ""
             comps = kw.get("competitors")
             if comps and isinstance(comps, list) and len(comps) > 0:
@@ -2290,8 +2456,8 @@ def generate_content_plan(context):
             )
 
     content_context = "\n".join(sections)
-    if len(content_context) > 30000:
-        content_context = content_context[:30000] + "\n[...truncated]"
+    if len(content_context) > 60000:
+        content_context = content_context[:60000] + "\n[...truncated]"
 
     logger.info(f"  Sending {len(content_context)} chars for topic clustering")
 
@@ -2301,7 +2467,7 @@ def generate_content_plan(context):
             _ensure_gemini_priority("Topic clustering should run on Gemini 3.1 Pro Preview")
             response = _call_gemini_chat_completion(
                 temperature=0.1,
-                max_tokens=16000,
+                max_tokens=24000,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": CLUSTER_PROMPT},
@@ -2455,6 +2621,50 @@ def generate_content_plan(context):
             site_data["clusters"] = validated_clusters
             validated_sites.append(site_data)
 
+    # Step 6: Coverage guardrail. The model can under-return sites or clusters; fill gaps
+    # conservatively using the same validated keyword pool so all output remains real data.
+    site_map = {clean_text(site.get("website")): site for site in validated_sites}
+    for site in configured_sites:
+        site_data = site_map.get(site)
+        if not site_data:
+            site_data = {
+                "website": site,
+                "summary": f"Focus {site} on validated content clusters built from real keyword opportunity data.",
+                "clusters": [],
+            }
+            site_map[site] = site_data
+
+        clusters = site_data.get("clusters", [])
+        existing_topics = {clean_text(c.get("cluster_topic")).lower() for c in clusters if clean_text(c.get("cluster_topic"))}
+        existing_primary_keys = {
+            clean_text((c.get("primary_keyword") or {}).get("keyword")).lower()
+            for c in clusters
+            if clean_text((c.get("primary_keyword") or {}).get("keyword"))
+        }
+        if len(clusters) < CLUSTER_MIN_PER_SITE:
+            fill_clusters = deterministic_site_clusters(
+                site,
+                all_keywords_by_site.get(site, []),
+                existing_topics,
+                existing_primary_keys,
+                strict_keys,
+            )
+            needed = CLUSTER_MAX_PER_SITE - len(clusters)
+            additions = fill_clusters[: max(0, needed)]
+            if additions:
+                logger.info(
+                    "  Added %s deterministic validated clusters for %s to improve weekly coverage",
+                    len(additions),
+                    site,
+                )
+                clusters.extend(additions)
+                site_data["clusters"] = clusters[:CLUSTER_MAX_PER_SITE]
+
+    validated_sites = [
+        site_map[site]
+        for site in configured_sites
+        if site_map.get(site, {}).get("clusters")
+    ]
     plan["sites"] = validated_sites
 
     total_clusters = sum(len(s.get("clusters", [])) for s in validated_sites)

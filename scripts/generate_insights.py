@@ -1857,7 +1857,7 @@ def _track_alert_history(site_reports):
 
     try:
         result = (
-            sb.table("ai_alert_tracking")
+            supabase.table("ai_alert_tracking")
             .select("alert_fingerprint, site, first_seen, last_seen, recovery_status, last_impact, occurrences")
             .limit(2000)
             .execute()
@@ -1923,10 +1923,10 @@ def _track_alert_history(site_reports):
 
     try:
         if rows_to_upsert:
-            sb.table("ai_alert_tracking").upsert(rows_to_upsert, on_conflict="alert_fingerprint").execute()
+            supabase.table("ai_alert_tracking").upsert(rows_to_upsert, on_conflict="alert_fingerprint").execute()
         for fingerprint, row in existing_by_fingerprint.items():
             if fingerprint not in current_fingerprints and row.get("recovery_status") != "resolved":
-                sb.table("ai_alert_tracking").update({
+                supabase.table("ai_alert_tracking").update({
                     "recovery_status": "resolved",
                     "resolved_at": today.isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2100,7 +2100,7 @@ def find_question_keyword(keywords: list) -> str | None:
 
 def compute_opportunity_score(volume: int, kd: int) -> float:
     """Compute opportunity score: high volume + low difficulty = high score."""
-    return round(volume * (1 / (kd + 1)), 1)
+    return min(9999.99, round(volume * (1 / (kd + 1)), 1))
 
 
 CLUSTER_PROMPT = """You are an expert SEO content strategist. Analyze the keyword data below and group related keywords into thematic content clusters.

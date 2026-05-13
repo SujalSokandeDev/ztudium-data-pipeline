@@ -770,6 +770,25 @@ def _call_gemini_chat_completion(**kwargs):
     )
 
 
+def _call_gemini_only_chat_completion(**kwargs):
+    """Use Gemini only for bounded cluster calls, avoiding OpenAI auth fallback noise."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    client = OpenAI(
+        api_key=GEMINI_API_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=float(os.getenv("CLUSTER_AI_TIMEOUT_SECONDS", "180")),
+    )
+    last_error = None
+    for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        try:
+            return client.chat.completions.create(model=model, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("  Gemini cluster call failed on %s: %s", model, str(exc)[:180])
+    raise RuntimeError(f"Gemini cluster models failed: {last_error}")
+
+
 def _site_rows(rows, website):
     return [r for r in rows or [] if r.get("website") == website]
 
@@ -2105,7 +2124,7 @@ def compute_opportunity_score(volume: int, kd: int) -> float:
 
 CLUSTER_MIN_PER_SITE = int(os.getenv("CLUSTER_MIN_PER_SITE", "5"))
 CLUSTER_MAX_PER_SITE = int(os.getenv("CLUSTER_MAX_PER_SITE", "10"))
-ENABLE_AI_CLUSTERING = os.getenv("ENABLE_AI_CLUSTERING", "false").lower() in {"1", "true", "yes"}
+ENABLE_AI_CLUSTERING = os.getenv("ENABLE_AI_CLUSTERING", "true").lower() in {"1", "true", "yes"}
 
 
 def keyword_cluster_key(keyword: str, cluster_label: str | None = None) -> str:
@@ -2457,8 +2476,8 @@ def generate_content_plan(context):
             )
 
     content_context = "\n".join(sections)
-    if len(content_context) > 60000:
-        content_context = content_context[:60000] + "\n[...truncated]"
+    if len(content_context) > 22000:
+        content_context = content_context[:22000] + "\n[...truncated]"
 
     if not ENABLE_AI_CLUSTERING:
         logger.info("  AI clustering disabled; building validated deterministic clusters from keyword gap data")
@@ -2513,10 +2532,9 @@ def generate_content_plan(context):
     # ── Step 4: AI clustering call ──
     try:
         with Spinner("Building keyword clusters"):
-            _ensure_gemini_priority("Topic clustering should run on Gemini 3.1 Pro Preview")
-            response = _call_gemini_chat_completion(
+            response = _call_gemini_only_chat_completion(
                 temperature=0.1,
-                max_tokens=24000,
+                max_tokens=8000,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": CLUSTER_PROMPT},
@@ -2555,10 +2573,10 @@ def generate_content_plan(context):
         logger.error(f"  Failed to parse cluster plan: {e}")
         if raw_preview:
             logger.error(f"  Raw cluster response preview: {raw_preview}")
-        return None
+        plan = {"week_of": date.today().isoformat(), "sites": []}
     except Exception as e:
         logger.error(f"  Clustering call failed: {e}")
-        return None
+        plan = {"week_of": date.today().isoformat(), "sites": []}
 
     # ── Step 5: Post-validation — strip hallucinated keywords, enrich with metadata ──
     validated_sites = []

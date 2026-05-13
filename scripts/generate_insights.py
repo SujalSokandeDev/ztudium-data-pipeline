@@ -2105,6 +2105,7 @@ def compute_opportunity_score(volume: int, kd: int) -> float:
 
 CLUSTER_MIN_PER_SITE = int(os.getenv("CLUSTER_MIN_PER_SITE", "5"))
 CLUSTER_MAX_PER_SITE = int(os.getenv("CLUSTER_MAX_PER_SITE", "10"))
+ENABLE_AI_CLUSTERING = os.getenv("ENABLE_AI_CLUSTERING", "false").lower() in {"1", "true", "yes"}
 
 
 def keyword_cluster_key(keyword: str, cluster_label: str | None = None) -> str:
@@ -2458,6 +2459,54 @@ def generate_content_plan(context):
     content_context = "\n".join(sections)
     if len(content_context) > 60000:
         content_context = content_context[:60000] + "\n[...truncated]"
+
+    if not ENABLE_AI_CLUSTERING:
+        logger.info("  AI clustering disabled; building validated deterministic clusters from keyword gap data")
+        plan = {"week_of": date.today().isoformat(), "sites": []}
+        validated_sites = []
+        site_map = {}
+        for site in configured_sites:
+            site_data = {
+                "website": site,
+                "summary": f"Focus {site} on validated content clusters built from real keyword opportunity data.",
+                "clusters": [],
+            }
+            fill_clusters = deterministic_site_clusters(
+                site,
+                all_keywords_by_site.get(site, []),
+                set(),
+                set(),
+                strict_keys,
+            )
+            if fill_clusters:
+                site_data["clusters"] = fill_clusters[:CLUSTER_MAX_PER_SITE]
+                site_map[site] = site_data
+
+        validated_sites = [
+            site_map[site]
+            for site in configured_sites
+            if site_map.get(site, {}).get("clusters")
+        ]
+        plan["sites"] = validated_sites
+
+        total_clusters = sum(len(s.get("clusters", [])) for s in validated_sites)
+        total_kws = sum(
+            1 + len(c.get("related_keywords", []))
+            for s in validated_sites
+            for c in s.get("clusters", [])
+        )
+        total_relaxed = sum(
+            c.get("relaxed_count", 0)
+            for s in validated_sites
+            for c in s.get("clusters", [])
+        )
+        logger.info(
+            f"  Validated deterministic clusters: {len(validated_sites)} sites, "
+            f"{total_clusters} clusters, {total_kws} keywords ({total_relaxed} under relaxed thresholds)"
+        )
+        if not validated_sites:
+            logger.warning("  Deterministic clustering produced no validated site clusters")
+        return plan if validated_sites else None
 
     logger.info(f"  Sending {len(content_context)} chars for topic clustering")
 

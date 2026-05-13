@@ -34,6 +34,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 sys.path.insert(0, os.path.dirname(__file__))
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET, WEBSITES
+from semantic_cluster_engine import materialize as materialize_semantic_clusters
 
 try:
     from dotenv import load_dotenv
@@ -3337,6 +3338,17 @@ def main():
                 }).eq("id", pipeline_run_id).execute()
             except Exception as e:
                 logger.warning("Could not track pipeline_run completion: %s", str(e)[:200])
+
+    if status in {"success", "partial"} and not args.internal_linking_only:
+        try:
+            result = materialize_semantic_clusters("ahrefs_ingestion")
+            logger.info(
+                "Semantic cluster refresh after Ahrefs: clusters=%s keywords=%s",
+                result.get("clusters"),
+                result.get("keywords"),
+            )
+        except Exception as exc:
+            logger.warning("Semantic cluster refresh skipped after Ahrefs: %s", str(exc)[:200])
 
     print("\n✅ Done!")
 

@@ -1,0 +1,58 @@
+name: Refresh Semantic Cluster Intelligence
+
+on:
+  schedule:
+    # Daily after the normal data refresh window.
+    - cron: "45 2 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Optional source insight date (YYYY-MM-DD). Leave blank for latest."
+        required: false
+        default: ""
+      site:
+        description: "Optional site filter, e.g. BusinessABC. Leave blank for all sites."
+        required: false
+        default: ""
+      trigger_source:
+        description: "Run label for audit/debugging."
+        required: false
+        default: "manual_workflow"
+
+permissions:
+  contents: read
+
+jobs:
+  refresh-semantic-clusters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      INPUT_DATE: ${{ github.event.inputs.date || '' }}
+      INPUT_SITE: ${{ github.event.inputs.site || '' }}
+      INPUT_TRIGGER_SOURCE: ${{ github.event.inputs.trigger_source || 'scheduled_refresh' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh semantic cluster intelligence
+        run: |
+          args=(--trigger-source "$INPUT_TRIGGER_SOURCE")
+          if [ -n "$INPUT_DATE" ]; then
+            args+=(--date "$INPUT_DATE")
+          fi
+          if [ -n "$INPUT_SITE" ]; then
+            args+=(--site "$INPUT_SITE")
+          fi
+          python scripts/semantic_cluster_engine.py "${args[@]}"

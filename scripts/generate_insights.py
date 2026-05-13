@@ -45,6 +45,7 @@ except ImportError as e:
     sys.exit(1)
 
 from ai_client import get_ai_client, ai_chat_completion_reliable, response_model_used, response_provider_used
+from semantic_cluster_engine import materialize as materialize_semantic_clusters
 try:
     from ai_client import _switch_to_gemini
 except ImportError:
@@ -3017,6 +3018,17 @@ def main():
     # ── Phase 4: Store Results ──
     print_header("PHASE 4  Storing Results")
     store_insights(insights, content_plan, site_reports, network_report)
+
+    if content_plan:
+        try:
+            semantic_result = materialize_semantic_clusters("weekly_insights")
+            print(
+                "\n  Semantic clusters refreshed: "
+                f"{semantic_result.get('clusters', 0)} clusters, "
+                f"{semantic_result.get('keywords', 0)} keywords"
+            )
+        except Exception as exc:
+            logger.warning("  Semantic cluster refresh skipped after weekly insights: %s", str(exc)[:200])
 
     print_header("PHASE 5  Generating Weekly PDF Report")
     pdf_result = generate_weekly_pdf_report(site_reports, network_report)

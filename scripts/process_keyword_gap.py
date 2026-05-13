@@ -28,6 +28,7 @@ import sys
 
 sys.path.insert(0, sys_path)
 from config import KEYWORD_GAP_BUCKET, SUPABASE_SERVICE_KEY, SUPABASE_URL
+from semantic_cluster_engine import materialize as materialize_semantic_clusters
 
 logging.basicConfig(
     level=logging.INFO,
@@ -704,6 +705,17 @@ def main():
             error_details=website_errors,
             duration_seconds=int(time.time() - started),
         )
+
+    if status in {"success", "partial"}:
+        try:
+            result = materialize_semantic_clusters("keyword_gap_ingestion")
+            logger.info(
+                "Semantic cluster refresh after keyword gap: clusters=%s keywords=%s",
+                result.get("clusters"),
+                result.get("keywords"),
+            )
+        except Exception as exc:
+            logger.warning("Semantic cluster refresh skipped after keyword gap: %s", str(exc)[:200])
 
     print("\nDone.")
 

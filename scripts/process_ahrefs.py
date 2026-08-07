@@ -26,6 +26,7 @@ import hashlib
 import logging
 import argparse
 import tempfile
+import subprocess
 import requests
 from datetime import date, datetime
 from urllib.parse import urlparse
@@ -3349,6 +3350,18 @@ def main():
             )
         except Exception as exc:
             logger.warning("Semantic cluster refresh skipped after Ahrefs: %s", str(exc)[:200])
+
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/check_ahrefs_traffic_alerts.py",
+                    "--send",
+                ],
+                check=True,
+            )
+        except Exception as exc:
+            logger.warning("Ahrefs traffic alert check skipped after import: %s", str(exc)[:200])
 
     print("\n✅ Done!")
 

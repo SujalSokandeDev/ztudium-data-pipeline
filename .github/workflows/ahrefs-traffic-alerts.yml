@@ -1,0 +1,54 @@
+name: Ahrefs Traffic Alerts
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Evaluate alerts without sending emails"
+        required: false
+        default: "false"
+      test_recipient:
+        description: "Send to Sujal only"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  ahrefs-traffic-alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+      DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
+      TEST_RECIPIENT_INPUT: ${{ github.event.inputs.test_recipient || 'false' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Ahrefs traffic alerts
+        run: |
+          ARGS="--send"
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          if [ "$TEST_RECIPIENT_INPUT" = "true" ]; then
+            ARGS="$ARGS --test-recipient"
+          fi
+          python scripts/check_ahrefs_traffic_alerts.py $ARGS

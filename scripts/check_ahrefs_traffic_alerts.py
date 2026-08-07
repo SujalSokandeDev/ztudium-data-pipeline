@@ -35,9 +35,9 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "AI.DNA Platform Intelligence <noreply@citiesabc.com>")
 
 DEFAULT_RECIPIENTS = [
-    "seo@ztudium.com",
-    "peyman.farahani@ztudium.com",
+    "sujal.sokande@ztudium.com",
     "neeraj.rajpal@ztudium.com",
+    "jonathan.vdb@ztudium.com",
 ]
 TEST_RECIPIENTS = ["sujal.sokande@ztudium.com"]
 
@@ -102,8 +102,14 @@ def _fingerprint(rule: AlertRule, website: str, severity: str, run_date: str) ->
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _dedupe_key(rule: AlertRule, website: str, severity: str, run_date: str) -> str:
-    return f"email:{rule.rule_id}:{website.lower()}:{severity}:{run_date}"
+def _recipient_group_key(recipients: list[str]) -> str:
+    normalized = ",".join(sorted(email.strip().lower() for email in recipients if email.strip()))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"recipients:{digest}"
+
+
+def _dedupe_key(rule: AlertRule, website: str, severity: str, run_date: str, recipients: list[str]) -> str:
+    return f"email:{rule.rule_id}:{website.lower()}:{severity}:{run_date}:{_recipient_group_key(recipients)}"
 
 
 def get_supabase_headers() -> dict[str, str]:
@@ -424,7 +430,7 @@ def main() -> None:
     sent = 0
     skipped = 0
     for alert in alerts:
-        dedupe_key = _dedupe_key(AHREFS_TRAFFIC_RULE, alert["website"], alert["email_severity"], run_date)
+        dedupe_key = _dedupe_key(AHREFS_TRAFFIC_RULE, alert["website"], alert["email_severity"], run_date, recipients)
         if has_email_been_sent(dedupe_key):
             skipped += 1
             logger.info("Skipping duplicate daily email for %s %s", alert["website"], alert["email_severity"])

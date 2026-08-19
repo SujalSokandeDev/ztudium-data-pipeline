@@ -29,9 +29,10 @@ jobs:
       - name: Write Google credentials
         run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > /tmp/google-credentials.json
 
-      - name: Fetch GSC + GA4 and upload to Supabase
+      - name: Fetch GSC + GA4 and upload to SEODash database
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
+          SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GSC_PROPERTY_CITIESABC: ${{ secrets.GSC_PROPERTY_CITIESABC }}
@@ -56,6 +57,7 @@ jobs:
 
       - name: Compute trend metrics
         env:
+          SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/compute_trends.py

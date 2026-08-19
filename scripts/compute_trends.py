@@ -10,6 +10,7 @@ import sys
 import json
 import logging
 from datetime import date, timedelta, datetime
+from decimal import Decimal
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -23,20 +24,30 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("supabase").setLevel(logging.WARNING)
 
 # ── Supabase setup ──────────────────────────────────────────
-try:
-    from supabase import create_client
-except ImportError:
-    logger.error("supabase package not installed. Run: pip install supabase")
-    sys.exit(1)
-
+SEODASH_DATABASE_URL = os.getenv("SEODASH_DATABASE_URL", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
-    sys.exit(1)
+if SEODASH_DATABASE_URL:
+    try:
+        import psycopg2
+        from psycopg2.extras import execute_values
+    except ImportError:
+        logger.error("psycopg2-binary is required when SEODASH_DATABASE_URL is set")
+        sys.exit(1)
+    supabase = None
+else:
+    try:
+        from supabase import create_client
+    except ImportError:
+        logger.error("supabase package not installed. Run: pip install supabase")
+        sys.exit(1)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.error("SEODASH_DATABASE_URL or SUPABASE_URL/SUPABASE_SERVICE_KEY must be set")
+        sys.exit(1)
+
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Dynamic Anomaly Thresholds ──────────────────────────────
 # Each metric has its own rules: threshold %, minimum absolute change,
@@ -176,6 +187,26 @@ def determine_severity(metric_name, dod_pct, absolute_change):
 def fetch_daily_data(website, days=LOOKBACK_DAYS):
     """Fetch daily_metrics for a website, ordered by date ascending."""
     since = (date.today() - timedelta(days=days)).isoformat()
+    if SEODASH_DATABASE_URL:
+        columns = ["date", "website", *DAILY_METRICS]
+        with psycopg2.connect(SEODASH_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT {", ".join(f'"{col}"' for col in columns)}
+                      FROM daily_metrics
+                     WHERE website = %s
+                       AND date >= %s
+                     ORDER BY date ASC
+                     LIMIT 1000
+                    """,
+                    (website, since),
+                )
+                return [
+                    {column: normalize_pg_value(value) for column, value in zip(columns, row)}
+                    for row in cur.fetchall()
+                ]
+
     result = supabase.table("daily_metrics") \
         .select("date, website, " + ", ".join(DAILY_METRICS)) \
         .eq("website", website) \
@@ -188,11 +219,68 @@ def fetch_daily_data(website, days=LOOKBACK_DAYS):
 
 def get_all_websites():
     """Get distinct website names from daily_metrics."""
+    if SEODASH_DATABASE_URL:
+        with psycopg2.connect(SEODASH_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT website FROM daily_metrics WHERE website IS NOT NULL")
+                return [row[0] for row in cur.fetchall()]
+
     result = supabase.table("daily_metrics") \
         .select("website") \
         .limit(2000) \
         .execute()
     return list(set(row["website"] for row in (result.data or [])))
+
+
+def normalize_pg_value(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def upsert_calculated_metrics(rows):
+    if not rows:
+        return 0
+    if SEODASH_DATABASE_URL:
+        columns = [
+            "date",
+            "website",
+            "metric_name",
+            "day_over_day_pct",
+            "week_over_week_pct",
+            "month_over_month_pct",
+            "seven_day_avg",
+            "is_anomaly",
+            "anomaly_description",
+            "severity",
+            "historical_percentile",
+            "site_wide_issue",
+            "cross_site_pattern",
+        ]
+        update_columns = [col for col in columns if col not in {"date", "website", "metric_name"}]
+        sql = f"""
+            INSERT INTO calculated_metrics ({", ".join(f'"{col}"' for col in columns)})
+            VALUES %s
+            ON CONFLICT ("date", "website", "metric_name")
+            DO UPDATE SET {", ".join(f'"{col}" = EXCLUDED."{col}"' for col in update_columns)}
+        """
+        values = [tuple(row.get(col) for col in columns) for row in rows]
+        with psycopg2.connect(SEODASH_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, values, page_size=250)
+            conn.commit()
+        return len(rows)
+
+    count = 0
+    for row in rows:
+        supabase.table("calculated_metrics").upsert(
+            row,
+            on_conflict="date,website,metric_name"
+        ).execute()
+        count += 1
+    return count
 
 
 # ── Trend Computation ───────────────────────────────────────
@@ -384,19 +472,15 @@ def main():
     # Phase 4: Upsert all results
     for website in sorted(all_results.keys()):
         trends = all_results[website]
-        for trend in trends:
-            try:
-                supabase.table("calculated_metrics").upsert(
-                    trend,
-                    on_conflict="date,website,metric_name"
-                ).execute()
-                total_upserted += 1
+        try:
+            total_upserted += upsert_calculated_metrics(trends)
+            for trend in trends:
                 if trend["is_anomaly"]:
                     total_anomalies += 1
                     severity_tag = f"[{(trend.get('severity') or 'medium').upper()}]"
                     logger.warning(f"  {severity_tag} {trend['anomaly_description']}")
-            except Exception as e:
-                logger.error(f"  Error upserting {website}/{trend['metric_name']}: {e}")
+        except Exception as e:
+            logger.error("  Error upserting calculated metrics for %s: %s", website, e)
 
     # Summary
     site_wide_count = sum(

@@ -3083,11 +3083,11 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
                 logger.warning("  ahrefs_pages skipped for %s (missing snapshot date)", ws)
                 continue
             pg_scopes.append({"website": ws, "date": snapshot_date, "source": "ahrefs"})
-            for pg in tp.get("pages", [])[:100]:
+            for page in tp.get("pages", [])[:100]:
                 pg_rows.append({k: v for k, v in {
-                    "date": snapshot_date, "website": ws, "url": pg.get("url"),
-                    "clicks": pg.get("traffic") or 0, "traffic_ahrefs": pg.get("traffic"),
-                    "keywords_count": pg.get("keywords_count"), "top_keyword": pg.get("top_keyword"),
+                    "date": snapshot_date, "website": ws, "url": page.get("url"),
+                    "clicks": page.get("traffic") or 0, "traffic_ahrefs": page.get("traffic"),
+                    "keywords_count": page.get("keywords_count"), "top_keyword": page.get("top_keyword"),
                     "source": "ahrefs",
                 }.items() if v is not None})
                 if run_id and pages_has_ingestion_run_id:

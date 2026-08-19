@@ -40,8 +40,6 @@ jobs:
       - name: Process Ahrefs CSVs
         env:
           SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -51,13 +49,9 @@ jobs:
       - name: Compute trend metrics
         env:
           SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/compute_trends.py
 
       - name: Validate broken and lost backlink URLs
         env:
           SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/validate_backlink_urls.py --batch-size 50 --batch-delay 2

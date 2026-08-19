@@ -24,13 +24,13 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+import seodash_db as pg
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("ahrefs_traffic_alerts")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "AI.DNA Platform Intelligence <noreply@citiesabc.com>")
 
@@ -112,69 +112,13 @@ def _dedupe_key(rule: AlertRule, website: str, severity: str, run_date: str, rec
     return f"email:{rule.rule_id}:{website.lower()}:{severity}:{run_date}:{_recipient_group_key(recipients)}"
 
 
-def get_supabase_headers() -> dict[str, str]:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
-    return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def supabase_rest_url(table: str) -> str:
-    return f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
-
-
-def supabase_select(table: str, params: dict[str, str]) -> list[dict[str, Any]]:
-    response = requests.get(
-        supabase_rest_url(table),
-        headers=get_supabase_headers(),
-        params=params,
-        timeout=60,
-    )
-    if not response.ok:
-        raise RuntimeError(f"Supabase select {table} failed: {response.status_code} {response.text[:300]}")
-    data = response.json()
-    return data if isinstance(data, list) else []
-
-
-def supabase_upsert(table: str, payload: dict[str, Any], conflict_key: str) -> None:
-    headers = {
-        **get_supabase_headers(),
-        "Prefer": "resolution=merge-duplicates",
-    }
-    response = requests.post(
-        supabase_rest_url(table),
-        headers=headers,
-        params={"on_conflict": conflict_key},
-        json=payload,
-        timeout=60,
-    )
-    if not response.ok:
-        raise RuntimeError(f"Supabase upsert {table} failed: {response.status_code} {response.text[:300]}")
-
-
-def supabase_update(table: str, payload: dict[str, Any], filters: dict[str, str]) -> None:
-    response = requests.patch(
-        supabase_rest_url(table),
-        headers=get_supabase_headers(),
-        params=filters,
-        json=payload,
-        timeout=60,
-    )
-    if not response.ok:
-        raise RuntimeError(f"Supabase update {table} failed: {response.status_code} {response.text[:300]}")
-
-
 def fetch_latest_ahrefs_overviews() -> list[dict[str, Any]]:
-    rows = supabase_select(
+    rows = pg.select_rows(
         "ahrefs_overview",
-        {
-            "select": "website,date,domain,organic_traffic,organic_traffic_delta,source_file",
-            "order": "date.desc",
-            "limit": "5000",
-        },
+        columns="website,date,domain,organic_traffic,organic_traffic_delta,source_file",
+        order_by="date",
+        desc=True,
+        limit=5000,
     )
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -289,13 +233,11 @@ def _email_text(alert: dict[str, Any]) -> str:
 
 def has_email_been_sent(dedupe_key: str) -> bool:
     try:
-        result = supabase_select(
+        result = pg.select_rows(
             "ai_alert_tracking",
-            {
-                "select": "alert_fingerprint",
-                "alert_fingerprint": f"eq.{dedupe_key}",
-                "limit": "1",
-            },
+            columns="alert_fingerprint",
+            filters={"alert_fingerprint": dedupe_key},
+            limit=1,
         )
         return bool(result)
     except Exception as exc:
@@ -322,7 +264,7 @@ def record_email_sent(dedupe_key: str, alert: dict[str, Any], recipients: list[s
         },
     }
     try:
-        supabase_upsert("ai_alert_tracking", payload, "alert_fingerprint")
+        pg.upsert_rows("ai_alert_tracking", [payload], "alert_fingerprint")
     except Exception as exc:
         logger.warning("Could not record email dedupe row: %s", str(exc)[:200])
 
@@ -357,13 +299,12 @@ def upsert_dashboard_alerts(alerts: list[dict[str, Any]]) -> None:
     if not alerts:
         return
 
-    latest = supabase_select(
+    latest = pg.select_rows(
         "daily_insights",
-        {
-            "select": "date,v2_site_reports",
-            "order": "date.desc",
-            "limit": "1",
-        },
+        columns="date,v2_site_reports",
+        order_by="date",
+        desc=True,
+        limit=1,
     )
     if not latest:
         logger.info("No daily_insights row found; skipping dashboard alert merge")
@@ -406,7 +347,7 @@ def upsert_dashboard_alerts(alerts: list[dict[str, Any]]) -> None:
         changed = True
 
     if changed:
-        supabase_update("daily_insights", {"v2_site_reports": site_reports}, {"date": f"eq.{date_value}"})
+        pg.update_where("daily_insights", {"v2_site_reports": site_reports}, {"date": date_value})
         logger.info("Merged %d Ahrefs threshold alert(s) into daily_insights.%s", len(alerts), date_value)
 
 
@@ -417,6 +358,9 @@ def main() -> None:
     parser.add_argument("--send", action="store_true", help="Actually send email alerts")
     parser.add_argument("--skip-dashboard", action="store_true", help="Do not merge active alerts into daily_insights")
     args = parser.parse_args()
+
+    if not pg.enabled():
+        raise RuntimeError("SEODASH_DATABASE_URL is required")
 
     rows = fetch_latest_ahrefs_overviews()
     alerts = [alert for row in rows if (alert := evaluate_rule(AHREFS_TRAFFIC_RULE, row))]

@@ -1,5 +1,5 @@
 """
-Process Ahrefs CSVs from Supabase Storage and upload parsed data to Supabase DB.
+Process Ahrefs CSVs from SEODash storage and upload parsed data to SEODash DB.
 
 This runs in GitHub Actions after CSVs are uploaded to storage.
 
@@ -7,7 +7,7 @@ Usage:
     python scripts/process_ahrefs.py --date-folder 2026-03-03
 
 What it does:
-  1. Downloads CSV/TXT files from Supabase Storage (ahrefs-exports bucket)
+  1. Downloads CSV/TXT files from SEODash storage (ahrefs-exports bucket)
   2. Parses overview .txt files (domain metrics, DR, backlinks, etc.)
   3. Parses 5 CSV types (organic keywords, referring domains, top pages,
      broken backlinks, organic competitors)
@@ -34,7 +34,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 sys.path.insert(0, os.path.dirname(__file__))
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET, WEBSITES
+import seodash_db as pg
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
+from seodash_storage import download_bucket_files
 
 try:
     from dotenv import load_dotenv
@@ -191,10 +193,23 @@ def _http_get(url: str, **kwargs):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Download from Supabase Storage
+#  Download from SEODash storage
 # ══════════════════════════════════════════════════════════════
 
 def download_from_storage(date_folder: str, temp_dir: str) -> list:
+    if pg.enabled():
+        try:
+            return download_bucket_files(
+                AHREFS_BUCKET,
+                date_folder,
+                temp_dir,
+                extensions=(".csv", ".txt"),
+                limit=200,
+            )
+        except Exception as e:
+            logger.error("Failed to download files from SEODash storage: %s", str(e)[:160], exc_info=True)
+            return []
+
     """Download all files from Supabase Storage bucket.
     
     Tries flat (root-level) files first (current upload format),
@@ -1924,8 +1939,11 @@ def _compute_cluster_hash(page_urls: list[str]) -> str:
 def _load_existing_clusters(client, domain: str) -> dict[str, dict]:
     """Load all existing clusters for a domain from the memory table."""
     try:
-        resp = client.table("internal_linking_clusters").select("*").eq("domain", domain).execute()
-        rows = resp.data or []
+        if pg.enabled():
+            rows = pg.select_rows("internal_linking_clusters", "*", filters={"domain": domain})
+        else:
+            resp = client.table("internal_linking_clusters").select("*").eq("domain", domain).execute()
+            rows = resp.data or []
     except Exception:
         return {}
     return {row["cluster_hash"]: row for row in rows}
@@ -1934,12 +1952,15 @@ def _load_existing_clusters(client, domain: str) -> dict[str, dict]:
 def _load_link_history(client, domain: str) -> set[tuple[str, str]]:
     """Load existing link pairs from history to avoid duplicates."""
     try:
-        resp = (
-            client.table("internal_linking_history")
-            .select("source_url,target_url")
-            .execute()
-        )
-        rows = resp.data or []
+        if pg.enabled():
+            rows = pg.select_rows("internal_linking_history", "source_url,target_url")
+        else:
+            resp = (
+                client.table("internal_linking_history")
+                .select("source_url,target_url")
+                .execute()
+            )
+            rows = resp.data or []
     except Exception:
         return set()
     return {(_normalize_url(r["source_url"]), _normalize_url(r["target_url"])) for r in rows}
@@ -2259,8 +2280,11 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
 
     # Load memory tables (graceful if tables don't exist yet)
     try:
-        from supabase import create_client
-        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        if pg.enabled():
+            client = None
+        else:
+            from supabase import create_client
+            client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         existing_clusters = _load_existing_clusters(client, site_name)
         link_history_pairs = _load_link_history(client, site_name)
     except Exception:
@@ -2357,7 +2381,7 @@ def generate_internal_link_suggestions(site_name: str, site_data: dict, limit: i
             })
 
     # Persist memory tables
-    if client:
+    if client or pg.enabled():
         try:
             if new_clusters_to_save:
                 for cluster_row in new_clusters_to_save:
@@ -2702,6 +2726,8 @@ def batch_upsert(client, table, rows, conflict_cols):
     """Batch upsert with key normalization."""
     if not rows:
         return 0
+    if pg.enabled():
+        return pg.upsert_rows(table, rows, conflict_cols, chunk_size=500)
     all_keys = set()
     for row in rows:
         all_keys.update(row.keys())
@@ -2778,6 +2804,9 @@ def _is_retryable_upsert_error(exc: Exception) -> bool:
 
 def _upsert_chunk(client, table: str, chunk: list, conflict_cols: str):
     """Upsert one chunk using supabase-py compatible parameters."""
+    if pg.enabled():
+        pg.upsert_rows(table, chunk, conflict_cols, chunk_size=len(chunk))
+        return
     client.table(table).upsert(chunk, on_conflict=conflict_cols).execute()
 
 
@@ -2785,6 +2814,8 @@ def delete_where(client, table: str, filters: dict, chunk_size: int = 1000) -> i
     """Delete rows matching filters. Returns deleted row count on best effort."""
     if not filters:
         return 0
+    if pg.enabled():
+        return pg.delete_where(table, filters)
     deleted = 0
     while True:
         query = client.table(table).select("id")
@@ -2818,6 +2849,13 @@ def replace_snapshot_rows(client, table: str, scopes: list[dict], label: str) ->
 
 def _start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
     """Create a run record; best effort only."""
+    if pg.enabled():
+        try:
+            return pg.start_ingestion_run(source, websites_attempted)
+        except Exception as e:
+            logger.warning("Could not start ingestion run tracking: %s", str(e)[:200])
+            return None
+
     from supabase import create_client
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -2848,6 +2886,20 @@ def _finish_ingestion_run(
     duration_seconds: int,
 ):
     """Finalize run tracking; best effort only."""
+    if pg.enabled():
+        try:
+            pg.finish_ingestion_run(
+                run_id,
+                status,
+                websites_succeeded,
+                websites_failed,
+                error_details,
+                duration_seconds,
+            )
+        except Exception as e:
+            logger.warning("Could not finalize ingestion run tracking: %s", str(e)[:200])
+        return
+
     if not run_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return
 
@@ -2874,6 +2926,9 @@ def _supports_column(client, table: str, column: str) -> bool:
     key = f"{table}.{column}"
     if key in _COLUMN_SUPPORT_CACHE:
         return _COLUMN_SUPPORT_CACHE[key]
+    if pg.enabled():
+        _COLUMN_SUPPORT_CACHE[key] = pg.supports_column(table, column)
+        return _COLUMN_SUPPORT_CACHE[key]
     try:
         client.table(table).select(column).limit(1).execute()
         _COLUMN_SUPPORT_CACHE[key] = True
@@ -2884,13 +2939,16 @@ def _supports_column(client, table: str, column: str) -> bool:
 
 
 def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_only: bool = False):
-    """Upload all parsed Ahrefs data to Supabase."""
-    from supabase import create_client
+    """Upload all parsed Ahrefs data to the configured SEODash database."""
+    if pg.enabled():
+        client = None
+    else:
+        from supabase import create_client
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logger.error("Supabase credentials not set")
-        return
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            logger.error("Supabase credentials not set")
+            return
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     overview_has_source_file = _supports_column(client, "ahrefs_overview", "source_file")
     ref_domains_has_source_file = _supports_column(client, "ahrefs_referring_domains", "source_file")
     broken_backlinks_has_source_file = _supports_column(client, "ahrefs_broken_backlinks", "source_file")
@@ -3193,7 +3251,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Process Ahrefs CSVs from Supabase Storage")
+    parser = argparse.ArgumentParser(description="Process Ahrefs CSVs from SEODash storage")
     parser.add_argument("--date-folder", default=date.today().isoformat(),
                         help="Date folder in storage (default: today)")
     parser.add_argument("--local-dir", default=None,
@@ -3281,7 +3339,12 @@ def main():
 
     # Track in pipeline_runs
     pipeline_run_id = None
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    if pg.enabled():
+        try:
+            pipeline_run_id = pg.start_pipeline_run("ahrefs")
+        except Exception as e:
+            logger.warning("Could not track pipeline_run start: %s", str(e)[:200])
+    elif SUPABASE_URL and SUPABASE_SERVICE_KEY:
         from supabase import create_client as _pr_create_client
         try:
             _pr_client = _pr_create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -3294,8 +3357,8 @@ def main():
         except Exception as e:
             logger.warning("Could not track pipeline_run start: %s", str(e)[:200])
 
-    # Upload to Supabase
-    print("\n--- Uploading to Supabase ---")
+    # Upload to the configured SEODash database.
+    print(f"\n--- Uploading to {'Postgres' if pg.enabled() else 'Supabase'} ---")
     status = "success"
     websites_succeeded = []
     websites_failed = []
@@ -3326,7 +3389,12 @@ def main():
         )
 
         # Track pipeline_runs completion
-        if pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        if pg.enabled():
+            try:
+                pg.finish_pipeline_run(pipeline_run_id, status, duration_seconds, parse_errors)
+            except Exception as e:
+                logger.warning("Could not track pipeline_run completion: %s", str(e)[:200])
+        elif pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
             from supabase import create_client as _pr_create_client2
             try:
                 _pr_client2 = _pr_create_client2(SUPABASE_URL, SUPABASE_SERVICE_KEY)

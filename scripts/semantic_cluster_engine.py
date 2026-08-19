@@ -26,16 +26,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-try:
-    from supabase import create_client
-except ImportError as exc:  # pragma: no cover
-    raise RuntimeError(f"Missing dependency: {exc}") from exc
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import seodash_db as pg  # noqa: E402
 from config import SUPABASE_SERVICE_KEY, SUPABASE_URL, WEBSITES  # noqa: E402
+
+if not pg.enabled():
+    try:
+        from supabase import create_client
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(f"Missing dependency: {exc}") from exc
 
 logging.basicConfig(
     level=logging.INFO,
@@ -216,6 +218,23 @@ def build_jontool_payload(site: str, cluster: dict[str, Any]) -> dict[str, Any]:
 
 
 def fetch_latest_content_plan(client, requested_date: str | None = None) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if pg.enabled():
+        rows = pg.select_rows(
+            "daily_insights",
+            "id, date, generated_at, content_plan",
+            filters={"date": requested_date} if requested_date else None,
+            order_by=None if requested_date else "date",
+            desc=True,
+            limit=1 if not requested_date else None,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        content_plan = row.get("content_plan") or {}
+        if isinstance(content_plan, str):
+            content_plan = json.loads(content_plan)
+        return row, content_plan
+
     query = client.table("daily_insights").select("id, date, generated_at, content_plan")
     if requested_date:
         query = query.eq("date", requested_date)
@@ -236,16 +255,27 @@ def fetch_history(client, site: str, keys: list[str]) -> dict[str, list[dict[str
     if not keys:
         return {}
     try:
-        response = (
-            client.table("semantic_opportunity_history")
-            .select("cluster_key, event_type, created_at")
-            .eq("site", site)
-            .in_("cluster_key", keys)
-            .order("created_at", desc=True)
-            .execute()
-        )
+        if pg.enabled():
+            rows = pg.select_rows(
+                "semantic_opportunity_history",
+                "cluster_key, event_type, created_at",
+                filters={"site": site},
+                in_filters={"cluster_key": keys},
+                order_by="created_at",
+                desc=True,
+            )
+        else:
+            response = (
+                client.table("semantic_opportunity_history")
+                .select("cluster_key, event_type, created_at")
+                .eq("site", site)
+                .in_("cluster_key", keys)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            rows = response.data or []
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in response.data or []:
+        for row in rows:
             grouped[row["cluster_key"]].append(row)
         return grouped
     except Exception as exc:
@@ -254,15 +284,18 @@ def fetch_history(client, site: str, keys: list[str]) -> dict[str, list[dict[str
 
 
 def upsert_many(client, table: str, rows: list[dict[str, Any]], on_conflict: str, chunk_size: int = 100) -> None:
+    if pg.enabled():
+        pg.upsert_rows(table, rows, on_conflict, chunk_size=chunk_size)
+        return
     for start in range(0, len(rows), chunk_size):
         client.table(table).upsert(rows[start:start + chunk_size], on_conflict=on_conflict).execute()
 
 
 def materialize(trigger_source: str, requested_date: str | None = None, site_filter: str | None = None) -> dict[str, Any]:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    if not pg.enabled() and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
 
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    client = None if pg.enabled() else create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     latest = fetch_latest_content_plan(client, requested_date)
     if not latest:
         raise RuntimeError("No daily_insights.content_plan found to materialize")
@@ -282,8 +315,12 @@ def materialize(trigger_source: str, requested_date: str | None = None, site_fil
         "sites_attempted": attempted,
         "validation_summary": {},
     }
-    run_response = client.table("semantic_cluster_runs").insert(run_row).execute()
-    run_id = (run_response.data or [{}])[0].get("id")
+    if pg.enabled():
+        run_response = pg.insert_rows("semantic_cluster_runs", [run_row], returning="id")
+        run_id = (run_response or [{}])[0].get("id")
+    else:
+        run_response = client.table("semantic_cluster_runs").insert(run_row).execute()
+        run_id = (run_response.data or [{}])[0].get("id")
     if not run_id:
         raise RuntimeError("Failed to create semantic_cluster_runs row")
 
@@ -372,14 +409,21 @@ def materialize(trigger_source: str, requested_date: str | None = None, site_fil
     try:
         if cluster_rows:
             upsert_many(client, "semantic_clusters", cluster_rows, "site,cluster_key")
-            cluster_lookup_rows = (
-                client.table("semantic_clusters")
-                .select("id, site, cluster_key")
-                .in_("cluster_key", [row["cluster_key"] for row in cluster_rows])
-                .execute()
-                .data
-                or []
-            )
+            if pg.enabled():
+                cluster_lookup_rows = pg.select_rows(
+                    "semantic_clusters",
+                    "id, site, cluster_key",
+                    in_filters={"cluster_key": [row["cluster_key"] for row in cluster_rows]},
+                )
+            else:
+                cluster_lookup_rows = (
+                    client.table("semantic_clusters")
+                    .select("id, site, cluster_key")
+                    .in_("cluster_key", [row["cluster_key"] for row in cluster_rows])
+                    .execute()
+                    .data
+                    or []
+                )
             cluster_ids = {(row["site"], row["cluster_key"]): row["id"] for row in cluster_lookup_rows}
             keyword_rows_to_write: list[dict[str, Any]] = []
             for key, rows in keyword_payloads_by_key.items():
@@ -392,9 +436,12 @@ def materialize(trigger_source: str, requested_date: str | None = None, site_fil
             if keyword_rows_to_write:
                 upsert_many(client, "semantic_cluster_keywords", keyword_rows_to_write, "cluster_id,keyword,keyword_role")
             if history_events:
-                client.table("semantic_opportunity_history").insert(history_events).execute()
+                if pg.enabled():
+                    pg.insert_rows("semantic_opportunity_history", history_events)
+                else:
+                    client.table("semantic_opportunity_history").insert(history_events).execute()
 
-        client.table("semantic_cluster_runs").update({
+        completion_payload = {
             "status": "completed" if not failed else "partial",
             "sites_succeeded": succeeded,
             "sites_failed": failed,
@@ -403,13 +450,21 @@ def materialize(trigger_source: str, requested_date: str | None = None, site_fil
             "validation_summary": dict(validation_counts),
             "error_details": errors,
             "completed_at": datetime.now(tz=timezone.utc).isoformat(),
-        }).eq("id", run_id).execute()
+        }
+        if pg.enabled():
+            pg.update_where("semantic_cluster_runs", completion_payload, {"id": run_id})
+        else:
+            client.table("semantic_cluster_runs").update(completion_payload).eq("id", run_id).execute()
     except Exception as exc:
-        client.table("semantic_cluster_runs").update({
+        failure_payload = {
             "status": "failed",
             "error_details": {"write": str(exc)},
             "completed_at": datetime.now(tz=timezone.utc).isoformat(),
-        }).eq("id", run_id).execute()
+        }
+        if pg.enabled():
+            pg.update_where("semantic_cluster_runs", failure_payload, {"id": run_id})
+        else:
+            client.table("semantic_cluster_runs").update(failure_payload).eq("id", run_id).execute()
         raise
 
     return {

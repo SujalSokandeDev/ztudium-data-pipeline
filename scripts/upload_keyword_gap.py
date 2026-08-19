@@ -1,5 +1,5 @@
 """
-Upload keyword gap CSV files to Supabase Storage.
+Upload keyword gap CSV files to SEODash storage.
 
 Run locally after exporting keyword-gap files from Ahrefs:
     python scripts/upload_keyword_gap.py
@@ -16,7 +16,8 @@ from datetime import date
 import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import KEYWORD_GAP_BUCKET, SUPABASE_SERVICE_KEY, SUPABASE_URL
+from config import KEYWORD_GAP_BUCKET
+from seodash_storage import clear_bucket as clear_storage_bucket, upload_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,13 +43,6 @@ DEFAULT_EXPORT_DIRS = [
 ]
 
 
-def _storage_headers():
-    return {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-    }
-
-
 def get_export_dir():
     env_dir = os.getenv("KEYWORD_GAP_EXPORT_DIR", "").strip()
     if env_dir and os.path.isdir(env_dir):
@@ -61,72 +55,33 @@ def get_export_dir():
 
 
 def clear_bucket():
-    logger.info("Clearing old files from bucket '%s'...", KEYWORD_GAP_BUCKET)
-    list_url = f"{SUPABASE_URL}/storage/v1/object/list/{KEYWORD_GAP_BUCKET}"
-    headers = _storage_headers()
-
     try:
-        resp = requests.post(
-            list_url,
-            headers=headers,
-            json={"prefix": "", "limit": 1000},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            logger.warning("Could not list bucket (HTTP %d)", resp.status_code)
-            return
-        files = [item.get("name", "") for item in resp.json()]
-        files = [f for f in files if f]
-        if not files:
-            logger.info("Bucket already empty")
-            return
-        base_url = f"{SUPABASE_URL}/storage/v1/object/{KEYWORD_GAP_BUCKET}"
-        deleted = 0
-        for name in files:
-            r = requests.delete(f"{base_url}/{name}", headers=headers, timeout=30)
-            if r.status_code in (200, 204):
-                deleted += 1
-        logger.info("Deleted %d old files", deleted)
+        deleted = clear_storage_bucket(KEYWORD_GAP_BUCKET)
+        logger.info("Deleted %d old files from bucket '%s'", deleted, KEYWORD_GAP_BUCKET)
     except Exception as exc:
         logger.warning("Bucket cleanup warning: %s", str(exc)[:160])
 
 
 def upload_files(export_dir: str):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logger.error("SUPABASE_URL or SUPABASE_SERVICE_KEY is missing")
-        return False
-
     files = sorted(glob.glob(os.path.join(export_dir, "*.csv")))
     if not files:
         logger.error("No CSV files found in %s", export_dir)
         return False
 
     logger.info("Uploading %d files from %s", len(files), export_dir)
-    upload_base = f"{SUPABASE_URL}/storage/v1/object/{KEYWORD_GAP_BUCKET}"
-    headers = _storage_headers()
-
     uploaded = 0
     failed = 0
     for path in files:
         name = os.path.basename(path)
         try:
-            with open(path, "rb") as f:
-                resp = requests.post(
-                    f"{upload_base}/{name}",
-                    headers={
-                        **headers,
-                        "Content-Type": "text/csv",
-                        "x-upsert": "true",
-                    },
-                    data=f,
-                    timeout=120,
-                )
-            if resp.status_code in (200, 201):
-                uploaded += 1
-                logger.info("  OK  %s", name)
-            else:
-                failed += 1
-                logger.error("  ERR %s (HTTP %d)", name, resp.status_code)
+            upload_file(
+                KEYWORD_GAP_BUCKET,
+                path,
+                name,
+                metadata={"source": "upload_keyword_gap", "upload_date": date.today().isoformat()},
+            )
+            uploaded += 1
+            logger.info("  OK  %s", name)
         except Exception as exc:
             failed += 1
             logger.error("  ERR %s (%s)", name, str(exc)[:120])
@@ -167,7 +122,7 @@ def trigger_workflow():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Upload keyword gap CSVs to Supabase storage")
+    parser = argparse.ArgumentParser(description="Upload keyword gap CSVs to SEODash storage")
     parser.add_argument(
         "--dir",
         dest="export_dir",

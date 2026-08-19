@@ -38,14 +38,21 @@ logging.getLogger("supabase").setLevel(logging.WARNING)
 
 # ── Dependencies ────────────────────────────────────────────
 try:
-    from supabase import create_client
     from openai import OpenAI
 except ImportError as e:
-    logger.error(f"Missing package: {e}. Run: pip install supabase openai")
+    logger.error(f"Missing package: {e}. Run: pip install openai")
     sys.exit(1)
 
+import seodash_db as pg
 from ai_client import get_ai_client, ai_chat_completion_reliable, response_model_used, response_provider_used
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
+from seodash_storage import upload_object
+if not pg.enabled():
+    try:
+        from supabase import create_client
+    except ImportError as e:
+        logger.error(f"Missing package: {e}. Run: pip install supabase")
+        sys.exit(1)
 try:
     from ai_client import _switch_to_gemini
 except ImportError:
@@ -56,15 +63,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
+if not pg.enabled() and (not SUPABASE_URL or not SUPABASE_KEY):
+    logger.error("SEODASH_DATABASE_URL or SUPABASE_URL/SUPABASE_SERVICE_KEY must be set")
     sys.exit(1)
 
 if not OPENAI_API_KEY and not GEMINI_API_KEY:
     logger.error("At least one of OPENAI_API_KEY or GEMINI_API_KEY must be set")
     sys.exit(1)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = None if pg.enabled() else create_client(SUPABASE_URL, SUPABASE_KEY)
 # AI client with automatic Gemini fallback (managed by ai_client module)
 openai_client = get_ai_client()
 
@@ -155,6 +162,42 @@ def print_box(title, subtitle=""):
 def safe_query(table, select, filters=None, order=None, limit=500, label="query"):
     """Execute a Supabase query with error handling. Returns [] on failure."""
     try:
+        if pg.enabled():
+            where_parts = []
+            values = []
+            op_map = {
+                "eq": "=",
+                "gte": ">=",
+                "lte": "<=",
+                "gt": ">",
+                "lt": "<",
+            }
+            for method, args in filters or []:
+                column, value = args
+                op = op_map.get(method)
+                if not op:
+                    raise ValueError(f"Unsupported Postgres filter method: {method}")
+                where_parts.append(f'"{column}" {op} %s')
+                values.append(value)
+            sql = f'SELECT {select} FROM "{table}"'
+            if where_parts:
+                sql += " WHERE " + " AND ".join(where_parts)
+            if order:
+                sql += f' ORDER BY "{order[0]}" {"DESC" if order[1] else "ASC"}'
+            if limit:
+                sql += " LIMIT %s"
+                values.append(limit)
+            with pg.connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, values)
+                    columns = [desc[0] for desc in cur.description]
+                    data = [
+                        {column: pg.normalize_value(value) for column, value in zip(columns, row)}
+                        for row in cur.fetchall()
+                    ]
+            logger.info(f"  [{label}] {len(data)} rows")
+            return data
+
         q = supabase.table(table).select(select)
         if filters:
             for method, args in filters:
@@ -476,13 +519,13 @@ def compute_page_movers(recent, previous):
 def compute_baselines(month_ago, quarter_ago):
     """Compute 30-day and 90-day baselines for key metrics per website."""
     try:
-        result = supabase.table("daily_metrics") \
-            .select("website, gsc_clicks, ga_sessions, domain_rating") \
-            .gte("date", quarter_ago) \
-            .limit(5000) \
-            .execute()
-
-        rows = result.data or []
+        rows = safe_query(
+            "daily_metrics",
+            "date, website, gsc_clicks, ga_sessions, domain_rating",
+            filters=[("gte", ("date", quarter_ago))],
+            limit=5000,
+            label="baselines",
+        )
         if not rows:
             return {}
 
@@ -1875,15 +1918,23 @@ def _track_alert_history(site_reports):
     tracking_available = True
 
     try:
-        result = (
-            supabase.table("ai_alert_tracking")
-            .select("alert_fingerprint, site, first_seen, last_seen, recovery_status, last_impact, occurrences")
-            .limit(2000)
-            .execute()
-        )
+        if pg.enabled():
+            existing_rows = pg.select_rows(
+                "ai_alert_tracking",
+                "alert_fingerprint, site, first_seen, last_seen, recovery_status, last_impact, occurrences",
+                limit=2000,
+            )
+        else:
+            result = (
+                supabase.table("ai_alert_tracking")
+                .select("alert_fingerprint, site, first_seen, last_seen, recovery_status, last_impact, occurrences")
+                .limit(2000)
+                .execute()
+            )
+            existing_rows = result.data or []
         existing_by_fingerprint = {
             row.get("alert_fingerprint"): row
-            for row in (result.data or [])
+            for row in existing_rows
             if row.get("alert_fingerprint")
         }
     except Exception as exc:
@@ -1942,14 +1993,21 @@ def _track_alert_history(site_reports):
 
     try:
         if rows_to_upsert:
-            supabase.table("ai_alert_tracking").upsert(rows_to_upsert, on_conflict="alert_fingerprint").execute()
+            if pg.enabled():
+                pg.upsert_rows("ai_alert_tracking", rows_to_upsert, "alert_fingerprint")
+            else:
+                supabase.table("ai_alert_tracking").upsert(rows_to_upsert, on_conflict="alert_fingerprint").execute()
         for fingerprint, row in existing_by_fingerprint.items():
             if fingerprint not in current_fingerprints and row.get("recovery_status") != "resolved":
-                supabase.table("ai_alert_tracking").update({
+                payload = {
                     "recovery_status": "resolved",
                     "resolved_at": today.isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("alert_fingerprint", fingerprint).execute()
+                }
+                if pg.enabled():
+                    pg.update_where("ai_alert_tracking", payload, {"alert_fingerprint": fingerprint})
+                else:
+                    supabase.table("ai_alert_tracking").update(payload).eq("alert_fingerprint", fingerprint).execute()
     except Exception as exc:
         logger.warning(f"Alert history update failed; reports were still generated: {exc}")
 
@@ -2763,22 +2821,25 @@ def store_insights(insights, content_plan=None, site_reports=None, network_repor
 
     row = {
         "date": today_str,
-        "insights": json.dumps(insights),
+        "insights": insights if pg.enabled() else json.dumps(insights),
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "dismissed_by_user": False,
     }
 
     if content_plan is not None:
-        row["content_plan"] = json.dumps(content_plan)
+        row["content_plan"] = content_plan if pg.enabled() else json.dumps(content_plan)
     if site_reports is not None:
-        row["v2_site_reports"] = json.dumps(site_reports)
+        row["v2_site_reports"] = site_reports if pg.enabled() else json.dumps(site_reports)
     if network_report is not None:
-        row["v2_network_report"] = json.dumps(network_report)
+        row["v2_network_report"] = network_report if pg.enabled() else json.dumps(network_report)
 
     try:
-        supabase.table("daily_insights").upsert(
-            row, on_conflict="date"
-        ).execute()
+        if pg.enabled():
+            pg.upsert_rows("daily_insights", [row], "date")
+        else:
+            supabase.table("daily_insights").upsert(
+                row, on_conflict="date"
+            ).execute()
         logger.info(f"  Stored {len(insights)} insights + content plan + v2 reports for {today_str}")
     except Exception as e:
         logger.error(f"  Failed to store insights: {e}")
@@ -3146,11 +3207,22 @@ def _build_weekly_pdf(site_reports, network_report):
 def generate_weekly_pdf_report(site_reports, network_report):
     """Generate and upload the branded weekly SEO intelligence PDF."""
     try:
-        import requests
-
         pdf_bytes = _build_weekly_pdf(site_reports, network_report)
         bucket = os.getenv("WEEKLY_REPORTS_BUCKET", "weekly-reports")
         path = f"{date.today().isoformat()}.pdf"
+        if pg.enabled():
+            upload_object(
+                bucket,
+                path,
+                pdf_bytes,
+                "application/pdf",
+                metadata={"source": "generate_insights", "report_date": date.today().isoformat()},
+            )
+            logger.info("  Weekly PDF report uploaded to SEODash storage: %s/%s", bucket, path)
+            return {"bucket": bucket, "path": path, "bytes": len(pdf_bytes)}
+
+        import requests
+
         auth_headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY}
         bucket_resp = requests.post(
             f"{SUPABASE_URL}/storage/v1/bucket",

@@ -27,6 +27,7 @@ jobs:
 
       - name: Validate backlink URLs
         env:
+          SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           URL_VALIDATION_CHECKPOINT_TABLE: pipeline_checkpoints

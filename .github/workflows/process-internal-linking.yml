@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       date_folder:
-        description: 'Date folder in Supabase Storage (YYYY-MM-DD). Blank = today.'
+        description: 'Date folder in SEODash storage (YYYY-MM-DD). Blank = today.'
         required: false
         default: ''
       bypass_layer2:
@@ -55,6 +55,7 @@ jobs:
 
       - name: Rebuild internal linking suggestions
         env:
+          SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

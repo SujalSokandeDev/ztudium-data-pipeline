@@ -12,6 +12,7 @@ import logging
 import time
 import uuid
 import re
+import json
 from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
@@ -19,6 +20,14 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # Add scripts dir to path
 sys.path.insert(0, os.path.dirname(__file__))
 from config import WEBSITES, SUPABASE_URL, SUPABASE_SERVICE_KEY, setup_google_credentials
+
+try:
+    import psycopg2
+    from psycopg2.extras import Json, execute_values
+except ImportError:
+    psycopg2 = None
+    Json = None
+    execute_values = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +41,7 @@ GSC_START_DATE = GSC_END_DATE - timedelta(days=30)
 GA4_END_DATE = date.today() - timedelta(days=1)
 GA4_START_DATE = GA4_END_DATE - timedelta(days=30)
 TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+SEODASH_DATABASE_URL = os.getenv("SEODASH_DATABASE_URL", "").strip()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -409,8 +419,232 @@ def fetch_ga4_daily(name, ga4_id):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Supabase upload
+#  Database upload
 # ══════════════════════════════════════════════════════════════
+
+def _json_value(value):
+    if Json is None:
+        return json.dumps(value)
+    return Json(value)
+
+
+def _pg_connection():
+    if not SEODASH_DATABASE_URL:
+        return None
+    if psycopg2 is None or execute_values is None:
+        raise RuntimeError("psycopg2-binary is required when SEODASH_DATABASE_URL is set")
+    return psycopg2.connect(SEODASH_DATABASE_URL)
+
+
+def _pg_batch_upsert(conn, table, rows, conflict_cols):
+    if not rows:
+        return 0
+    all_keys = sorted({key for row in rows for key in row.keys()})
+    columns_sql = ", ".join(f'"{key}"' for key in all_keys)
+    update_sql = ", ".join(
+        f'"{key}" = EXCLUDED."{key}"'
+        for key in all_keys
+        if key not in conflict_cols and key != "id"
+    )
+    conflict_sql = ", ".join(f'"{key}"' for key in conflict_cols)
+    sql = (
+        f'INSERT INTO "{table}" ({columns_sql}) VALUES %s '
+        f"ON CONFLICT ({conflict_sql}) DO UPDATE SET {update_sql}"
+    )
+    values = [tuple(row.get(key) for key in all_keys) for row in rows]
+    with conn.cursor() as cur:
+        for i in range(0, len(values), 500):
+            execute_values(cur, sql, values[i : i + 500], page_size=500)
+    conn.commit()
+    return len(rows)
+
+
+def _pg_start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
+    conn = _pg_connection()
+    if conn is None:
+        return None
+    run_id = str(uuid.uuid4())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ingestion_runs (id, source, status, websites_attempted)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (run_id, source, "running", _json_value(websites_attempted)),
+            )
+        conn.commit()
+        return run_id
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Could not start Postgres ingestion run tracking: %s", str(e)[:200])
+        return None
+    finally:
+        conn.close()
+
+
+def _pg_finish_ingestion_run(
+    run_id: str | None,
+    status: str,
+    websites_succeeded: list[str],
+    websites_failed: list[str],
+    error_details: dict,
+    duration_seconds: int,
+):
+    if not run_id:
+        return
+    conn = _pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ingestion_runs
+                   SET status = %s,
+                       websites_succeeded = %s,
+                       websites_failed = %s,
+                       error_details = %s,
+                       duration_seconds = %s,
+                       completed_at = NOW()
+                 WHERE id = %s
+                """,
+                (
+                    status,
+                    _json_value(websites_succeeded),
+                    _json_value(websites_failed),
+                    _json_value(error_details),
+                    duration_seconds,
+                    run_id,
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Could not finish Postgres ingestion run tracking: %s", str(e)[:200])
+    finally:
+        conn.close()
+
+
+def _pg_start_pipeline_run() -> str | None:
+    conn = _pg_connection()
+    if conn is None:
+        return None
+    run_id = str(uuid.uuid4())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pipeline_runs (id, pipeline, status)
+                VALUES (%s, %s, %s)
+                """,
+                (run_id, "google", "running"),
+            )
+        conn.commit()
+        return run_id
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Could not track Postgres pipeline_run start: %s", str(e)[:200])
+        return None
+    finally:
+        conn.close()
+
+
+def _pg_finish_pipeline_run(run_id: str | None, status: str, duration_seconds: int, error_details: dict):
+    if not run_id:
+        return
+    conn = _pg_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE pipeline_runs
+                   SET status = %s,
+                       completed_at = NOW(),
+                       error_message = %s,
+                       details = %s
+                 WHERE id = %s
+                """,
+                (
+                    "completed" if status in ("success", "partial") else "failed",
+                    None if status in ("success", "partial") else json.dumps(error_details)[:1000],
+                    _json_value({"duration_seconds": duration_seconds}),
+                    run_id,
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.warning("Could not track Postgres pipeline_run completion: %s", str(e)[:200])
+    finally:
+        conn.close()
+
+
+def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = None, site_report=None):
+    conn = _pg_connection()
+    if conn is None:
+        return False
+    today_str = date.today().isoformat()
+    fetched_at = datetime.now(tz=timezone.utc).isoformat()
+    try:
+        dm_rows = []
+        for name, rows in all_data.items():
+            report = (site_report or {}).get(name, {})
+            for row in rows:
+                db_row = {
+                    "date": row.get("date"),
+                    "website": name,
+                    "gsc_clicks": row.get("gsc_clicks"),
+                    "gsc_impressions": row.get("gsc_impressions"),
+                    "gsc_ctr": row.get("gsc_ctr"),
+                    "gsc_position": row.get("gsc_position"),
+                    "ga_sessions": row.get("ga_sessions"),
+                    "ga_users": row.get("ga_users"),
+                    "ga_organic_sessions": row.get("ga_organic_sessions"),
+                    "ga_organic_users": row.get("ga_organic_users"),
+                    "ga_engagement_time": row.get("ga_engagement_time"),
+                    "ga_bounce_rate": row.get("ga_bounce_rate"),
+                    "data_source": "api",
+                    "ingestion_run_id": run_id,
+                    "gsc_status": report.get("gsc_status"),
+                    "gsc_status_reason": report.get("gsc_reason"),
+                    "ga4_status": report.get("ga4_status"),
+                    "ga4_status_reason": report.get("ga4_reason"),
+                    "source_fetched_at": fetched_at,
+                }
+                dm_rows.append({k: v for k, v in db_row.items() if v is not None})
+        c = _pg_batch_upsert(conn, "daily_metrics", dm_rows, ["date", "website"])
+        logger.info("  daily_metrics: %d/%d upserted to Postgres", c, len(dm_rows))
+
+        kw_rows = []
+        for name, kws in keywords_data.items():
+            for kw in kws[:100]:
+                kw_rows.append({
+                    "date": today_str, "website": name, "keyword": kw.get("keyword"),
+                    "clicks": kw.get("clicks"), "impressions": kw.get("impressions"),
+                    "ctr": kw.get("ctr"), "position": kw.get("position"), "source": "gsc",
+                    "ingestion_run_id": run_id,
+                })
+        c = _pg_batch_upsert(conn, "website_keywords", kw_rows, ["date", "website", "keyword", "source"])
+        logger.info("  website_keywords (GSC): %d/%d upserted to Postgres", c, len(kw_rows))
+
+        pg_rows = []
+        for name, pgs in pages_data.items():
+            for pg in pgs[:50]:
+                pg_rows.append({
+                    "date": today_str, "website": name, "url": pg.get("url"),
+                    "clicks": pg.get("clicks"), "impressions": pg.get("impressions"),
+                    "ctr": pg.get("ctr"), "position": pg.get("position"), "source": "gsc",
+                    "ingestion_run_id": run_id,
+                })
+        c = _pg_batch_upsert(conn, "website_pages", pg_rows, ["date", "website", "url", "source"])
+        logger.info("  website_pages (GSC): %d/%d upserted to Postgres", c, len(pg_rows))
+        return True
+    finally:
+        conn.close()
+
 
 def batch_upsert(client, table, rows, conflict_cols):
     """Batch upsert with key normalization."""
@@ -549,7 +783,7 @@ def _supports_column(client, table: str, column: str) -> bool:
     return _COLUMN_SUPPORT_CACHE[key]
 
 
-def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None, site_report=None):
+def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None):
     """Upload all fetched data to Supabase."""
     from supabase import create_client
 
@@ -558,20 +792,11 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
         return
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     daily_metrics_has_ingestion_run_id = _supports_column(client, "daily_metrics", "ingestion_run_id")
-    daily_metrics_source_status_columns = {
-        "gsc_status": _supports_column(client, "daily_metrics", "gsc_status"),
-        "gsc_status_reason": _supports_column(client, "daily_metrics", "gsc_status_reason"),
-        "ga4_status": _supports_column(client, "daily_metrics", "ga4_status"),
-        "ga4_status_reason": _supports_column(client, "daily_metrics", "ga4_status_reason"),
-        "source_fetched_at": _supports_column(client, "daily_metrics", "source_fetched_at"),
-    }
     today_str = date.today().isoformat()
-    fetched_at = datetime.now(timezone.utc).isoformat()
 
     # Daily metrics
     dm_rows = []
     for name, rows in all_data.items():
-        source_status = (site_report or {}).get(name, {})
         for row in rows:
             db_row = {
                 "date": row.get("date"),
@@ -590,16 +815,6 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
             }
             if run_id and daily_metrics_has_ingestion_run_id:
                 db_row["ingestion_run_id"] = run_id
-            if daily_metrics_source_status_columns["gsc_status"]:
-                db_row["gsc_status"] = source_status.get("gsc_status")
-            if daily_metrics_source_status_columns["gsc_status_reason"]:
-                db_row["gsc_status_reason"] = source_status.get("gsc_reason")
-            if daily_metrics_source_status_columns["ga4_status"]:
-                db_row["ga4_status"] = source_status.get("ga4_status")
-            if daily_metrics_source_status_columns["ga4_status_reason"]:
-                db_row["ga4_status_reason"] = source_status.get("ga4_reason")
-            if daily_metrics_source_status_columns["source_fetched_at"]:
-                db_row["source_fetched_at"] = fetched_at
             dm_rows.append({k: v for k, v in db_row.items() if v is not None})
     c = batch_upsert(client, "daily_metrics", dm_rows, "date,website")
     logger.info("  daily_metrics: %d/%d upserted", c, len(dm_rows))
@@ -645,11 +860,12 @@ def main():
     init_google_apis()
     run_started = time.time()
     all_website_names = [ws["name"] for ws in WEBSITES]
-    run_id = _start_ingestion_run("google", all_website_names)
+    use_postgres = bool(SEODASH_DATABASE_URL)
+    run_id = _pg_start_ingestion_run("google", all_website_names) if use_postgres else _start_ingestion_run("google", all_website_names)
 
     # Track in pipeline_runs
-    pipeline_run_id = None
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    pipeline_run_id = _pg_start_pipeline_run() if use_postgres else None
+    if not use_postgres and SUPABASE_URL and SUPABASE_SERVICE_KEY:
         from supabase import create_client
         try:
             client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -776,12 +992,15 @@ def main():
             _status_text(rep["ga4_status"], rep["ga4_reason"]),
         )
 
-    # Upload to Supabase
-    print("\n--- Uploading to Supabase ---")
+    # Upload to the configured SEODash database.
+    print(f"\n--- Uploading to {'Postgres' if use_postgres else 'Supabase'} ---")
     status = "success"
     upload_failed = False
     try:
-        store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
+        if use_postgres:
+            store_in_postgres(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
+        else:
+            store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id)
         if websites_failed and websites_succeeded:
             status = "partial"
         elif websites_failed and not websites_succeeded:
@@ -790,20 +1009,32 @@ def main():
         status = "failed"
         error_details["upload"] = str(e)
         upload_failed = True
-        logger.error("Supabase upload failed: %s", str(e)[:220])
+        logger.error("Database upload failed: %s", str(e)[:220])
     finally:
         duration_seconds = int(time.time() - run_started)
-        _finish_ingestion_run(
-            run_id=run_id,
-            status=status,
-            websites_succeeded=websites_succeeded,
-            websites_failed=websites_failed,
-            error_details=error_details,
-            duration_seconds=duration_seconds,
-        )
+        if use_postgres:
+            _pg_finish_ingestion_run(
+                run_id=run_id,
+                status=status,
+                websites_succeeded=websites_succeeded,
+                websites_failed=websites_failed,
+                error_details=error_details,
+                duration_seconds=duration_seconds,
+            )
+        else:
+            _finish_ingestion_run(
+                run_id=run_id,
+                status=status,
+                websites_succeeded=websites_succeeded,
+                websites_failed=websites_failed,
+                error_details=error_details,
+                duration_seconds=duration_seconds,
+            )
         
         # Track pipeline_runs completion
-        if pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        if use_postgres:
+            _pg_finish_pipeline_run(pipeline_run_id, status, duration_seconds, error_details)
+        elif pipeline_run_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
             from supabase import create_client as _pr_create_client
             try:
                 _pr_client = _pr_create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)

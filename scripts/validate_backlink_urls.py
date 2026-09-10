@@ -18,9 +18,12 @@ from urllib.parse import urlparse
 
 import requests
 from requests import Response
-from supabase import create_client
 
+import seodash_db as pg
 from config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+
+if not pg.enabled():
+    from supabase import create_client
 
 
 logging.basicConfig(
@@ -258,6 +261,9 @@ def backlink_present(page_html: str, target_url: str) -> bool:
 
 
 def fetch_all_rows(client, table: str, page_size: int = 1000) -> list[dict]:
+    if pg.enabled():
+        return pg.select_rows(table, "*")
+
     rows = []
     start = 0
     while True:
@@ -274,6 +280,9 @@ def fetch_all_rows(client, table: str, page_size: int = 1000) -> list[dict]:
 
 
 def fetch_rows_by_status(client, table: str, status: str, page_size: int = 1000) -> list[dict]:
+    if pg.enabled():
+        return pg.select_rows(table, "*", filters={"validation_status": status})
+
     rows = []
     start = 0
     while True:
@@ -331,21 +340,30 @@ def chunked(items: list[dict], size: int) -> Iterable[list[dict]]:
 
 def load_checkpoint(client) -> tuple[str | None, str | None]:
     try:
-        response = execute_with_retries(
-            "load URL validation checkpoint",
-            lambda: (
-                client.table(CHECKPOINT_TABLE)
-                .select("last_table,last_row_id")
-                .eq("pipeline_name", CHECKPOINT_KEY)
-                .limit(1)
-                .execute()
-            ),
-        )
+        if pg.enabled():
+            rows = pg.select_rows(
+                CHECKPOINT_TABLE,
+                "last_table,last_row_id",
+                filters={"pipeline_name": CHECKPOINT_KEY},
+                limit=1,
+            )
+        else:
+            response = execute_with_retries(
+                "load URL validation checkpoint",
+                lambda: (
+                    client.table(CHECKPOINT_TABLE)
+                    .select("last_table,last_row_id")
+                    .eq("pipeline_name", CHECKPOINT_KEY)
+                    .limit(1)
+                    .execute()
+                ),
+            )
+            rows = response.data or []
     except Exception as exc:
         logger.warning("Checkpoint load skipped: %s", str(exc)[:200])
         return None, None
 
-    row = (response.data or [{}])[0]
+    row = (rows or [{}])[0]
     return row.get("last_table"), row.get("last_row_id")
 
 
@@ -361,10 +379,13 @@ def save_checkpoint(client, last_table: str, last_row_id: str, processed: int):
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        execute_with_retries(
-            "save URL validation checkpoint",
-            lambda: client.table(CHECKPOINT_TABLE).upsert(payload, on_conflict="pipeline_name").execute(),
-        )
+        if pg.enabled():
+            pg.upsert_rows(CHECKPOINT_TABLE, [payload], "pipeline_name")
+        else:
+            execute_with_retries(
+                "save URL validation checkpoint",
+                lambda: client.table(CHECKPOINT_TABLE).upsert(payload, on_conflict="pipeline_name").execute(),
+            )
     except Exception as exc:
         logger.warning("Checkpoint save skipped: %s", str(exc)[:200])
 
@@ -398,10 +419,13 @@ def apply_validation_update(client, table: str, row_id: str, status: str, notes:
     else:
         payload["resolved_at"] = None
     try:
-        execute_with_retries(
-            f"update {table} row {row_id}",
-            lambda: client.table(table).update(payload).eq("id", row_id).execute(),
-        )
+        if pg.enabled():
+            pg.update_where(table, payload, {"id": row_id})
+        else:
+            execute_with_retries(
+                f"update {table} row {row_id}",
+                lambda: client.table(table).update(payload).eq("id", row_id).execute(),
+            )
         return True
     except Exception as exc:
         logger.warning("%s row %s update skipped after retries: %s", table, row_id, str(exc)[:200])
@@ -453,10 +477,10 @@ def validate_lost_backlink_row(row: dict) -> tuple[str, str]:
 
 
 def run_validation(batch_size: int, batch_delay: float, recheck_resolved_after_hours: int):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    if not pg.enabled() and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    client = None if pg.enabled() else create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     broken_rows = fetch_rows_for_validation(
         client,
         "ahrefs_broken_backlinks",

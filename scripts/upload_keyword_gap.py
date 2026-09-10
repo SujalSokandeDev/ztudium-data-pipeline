@@ -69,7 +69,6 @@ def upload_files(export_dir: str):
         return False
 
     logger.info("Uploading %d files from %s", len(files), export_dir)
-
     uploaded = 0
     failed = 0
     for path in files:

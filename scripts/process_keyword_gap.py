@@ -28,6 +28,7 @@ import sys
 
 sys.path.insert(0, sys_path)
 from config import KEYWORD_GAP_BUCKET, SUPABASE_SERVICE_KEY, SUPABASE_URL
+import seodash_db as pg
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
 from seodash_storage import download_bucket_files
 
@@ -456,17 +457,64 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
 
 
 def download_from_storage(date_folder: str, temp_dir: str) -> list[str]:
-    try:
-        return download_bucket_files(
-            KEYWORD_GAP_BUCKET,
-            date_folder,
-            temp_dir,
-            extensions=(".csv",),
-            limit=500,
-        )
-    except Exception as exc:
-        logger.error("Failed to download files from SEODash storage: %s", str(exc)[:160])
+    if pg.enabled():
+        try:
+            return download_bucket_files(
+                KEYWORD_GAP_BUCKET,
+                date_folder,
+                temp_dir,
+                extensions=(".csv",),
+                limit=500,
+            )
+        except Exception as exc:
+            logger.error("Failed to download files from SEODash storage: %s", str(exc)[:160])
+            return []
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+    }
+    list_url = f"{SUPABASE_URL}/storage/v1/object/list/{KEYWORD_GAP_BUCKET}"
+
+    resp = _http_post(
+        list_url,
+        headers=headers,
+        json={"prefix": "", "limit": 500},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        logger.error("Failed to list bucket files (HTTP %d)", resp.status_code)
         return []
+
+    items = [item for item in resp.json() if item.get("name", "").lower().endswith(".csv")]
+    prefix = ""
+    if not items:
+        resp = _http_post(
+            list_url,
+            headers=headers,
+            json={"prefix": f"{date_folder}/", "limit": 500},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            items = [item for item in resp.json() if item.get("name", "").lower().endswith(".csv")]
+            prefix = f"{date_folder}/"
+
+    downloaded = []
+    for item in items:
+        name = item.get("name", "")
+        if not name:
+            continue
+        storage_path = f"{prefix}{name}" if prefix else name
+        url = f"{SUPABASE_URL}/storage/v1/object/{KEYWORD_GAP_BUCKET}/{storage_path}"
+        r = _http_get(url, headers=headers, timeout=120)
+        if r.status_code != 200:
+            logger.warning("Failed to download %s (HTTP %d)", storage_path, r.status_code)
+            continue
+        local_path = os.path.join(temp_dir, name)
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+        downloaded.append(local_path)
+    return downloaded
 
 
 def _is_retryable_upsert_error(exc: Exception) -> bool:
@@ -474,10 +522,15 @@ def _is_retryable_upsert_error(exc: Exception) -> bool:
 
 
 def _upsert_chunk(client, table: str, chunk: list[dict], on_conflict: str):
+    if pg.enabled():
+        pg.upsert_rows(table, chunk, on_conflict, chunk_size=len(chunk))
+        return
     client.table(table).upsert(chunk, on_conflict=on_conflict).execute()
 
 
 def _supports_column(client, table: str, column: str) -> bool:
+    if pg.enabled():
+        return pg.supports_column(table, column)
     try:
         client.table(table).select(column).limit(1).execute()
         return True
@@ -521,10 +574,7 @@ def batch_upsert(client, rows: list[dict], run_id: str | None = None) -> int:
         if not ok:
             for row in chunk:
                 try:
-                    client.table("content_gap_keywords").upsert(
-                        [row],
-                        on_conflict="date,website,keyword",
-                    ).execute()
+                    _upsert_chunk(client, "content_gap_keywords", [row], "date,website,keyword")
                     inserted += 1
                 except Exception as exc:
                     logger.error(
@@ -541,6 +591,13 @@ def batch_upsert(client, rows: list[dict], run_id: str | None = None) -> int:
 
 
 def _start_ingestion_run(source: str, websites_attempted: list[str]) -> str | None:
+    if pg.enabled():
+        try:
+            return pg.start_ingestion_run(source, websites_attempted)
+        except Exception as exc:
+            logger.warning("Run tracking start failed: %s", str(exc)[:200])
+            return None
+
     from supabase import create_client
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -570,6 +627,20 @@ def _finish_ingestion_run(
     error_details: dict,
     duration_seconds: int,
 ):
+    if pg.enabled():
+        try:
+            pg.finish_ingestion_run(
+                run_id,
+                status,
+                websites_succeeded,
+                websites_failed,
+                error_details,
+                duration_seconds,
+            )
+        except Exception as exc:
+            logger.warning("Run tracking finish failed: %s", str(exc)[:200])
+        return
+
     from supabase import create_client
 
     if not run_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -644,9 +715,11 @@ def main():
             ", ".join(f"{reason}={count}" for reason, count in sorted(total_filtered_counts.items())),
         )
 
-    from supabase import create_client
-
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    if pg.enabled():
+        client = None
+    else:
+        from supabase import create_client
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     run_id = _start_ingestion_run("keyword_gap", sorted(website_seen))
     status = "success"
     succeeded = []

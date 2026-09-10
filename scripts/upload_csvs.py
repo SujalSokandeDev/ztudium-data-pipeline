@@ -76,6 +76,7 @@ def clear_bucket():
         logger.info("Continuing with upload anyway; matching files will be overwritten")
 
 
+# ══════════════════════════════════════════════════════════════
 #  Step 2: Upload new files
 # ══════════════════════════════════════════════════════════════
 
@@ -111,20 +112,17 @@ def upload_to_seodash_storage(export_dir: str):
         except Exception as e:
             failed += 1
             logger.error("  ERR %s - %s", filename, str(e)[:120])
-        time.sleep(0.3)
+
+        time.sleep(0.3)  # Rate limiting
 
     total_mb = total_size / 1024 / 1024
     logger.info("")
-    logger.info(
-        "Upload complete: %d/%d files (%.1f MB total), %d failed",
-        uploaded,
-        len(files),
-        total_mb,
-        failed,
-    )
+    logger.info("Upload complete: %d/%d files (%.1f MB total), %d failed",
+                uploaded, len(files), total_mb, failed)
     return failed == 0
 
 
+# ══════════════════════════════════════════════════════════════
 #  Step 3: Trigger GitHub Action
 # ══════════════════════════════════════════════════════════════
 

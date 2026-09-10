@@ -1,233 +1,257 @@
-"""Small Supabase-style database adapter backed by SEODASH_DATABASE_URL."""
+"""
+Small Postgres helper for SEODash pipeline scripts.
+
+The pipeline now writes to the dedicated SEODASH_DATABASE_URL database. A few
+scripts still keep Supabase fallback paths for local compatibility, but GitHub
+Actions should prefer these helpers whenever SEODASH_DATABASE_URL is present.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import re
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 
-class QueryResult:
-    def __init__(self, data: list[dict[str, Any]] | None = None):
-        self.data = data or []
+def database_url() -> str:
+    return os.getenv("SEODASH_DATABASE_URL", "").strip()
 
 
-class PostgresQuery:
-    def __init__(self, database_url: str, table: str):
-        self.database_url = database_url
-        self.table = table
-        self.select_clause = "*"
-        self.filters: list[tuple[str, str, Any]] = []
-        self.orders: list[tuple[str, bool]] = []
-        self.row_limit: int | None = None
-        self.insert_rows: list[dict[str, Any]] | None = None
-        self.update_values: dict[str, Any] | None = None
-        self.upsert_rows: list[dict[str, Any]] | None = None
-        self.upsert_conflict: str | None = None
+def enabled() -> bool:
+    return bool(database_url())
 
-    def select(self, select_clause: str):
-        self.select_clause = select_clause or "*"
-        return self
 
-    def eq(self, column: str, value: Any):
-        self.filters.append((column, "=", value))
-        return self
+def connect():
+    value = database_url()
+    if not value:
+        raise RuntimeError("SEODASH_DATABASE_URL must be set")
+    return psycopg2.connect(value)
 
-    def neq(self, column: str, value: Any):
-        self.filters.append((column, "<>", value))
-        return self
 
-    def gte(self, column: str, value: Any):
-        self.filters.append((column, ">=", value))
-        return self
+def normalize_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, (dict, list)):
+        return value
+    return value
 
-    def gt(self, column: str, value: Any):
-        self.filters.append((column, ">", value))
-        return self
 
-    def lte(self, column: str, value: Any):
-        self.filters.append((column, "<=", value))
-        return self
+def adapt_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return Json(value)
+    return value
 
-    def lt(self, column: str, value: Any):
-        self.filters.append((column, "<", value))
-        return self
 
-    def in_(self, column: str, values: list[Any]):
-        self.filters.append((column, "IN", values or []))
-        return self
+def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: normalize_value(value) for key, value in row.items()}
 
-    def order(self, column: str, desc: bool = False):
-        self.orders.append((column, bool(desc)))
-        return self
 
-    def limit(self, value: int):
-        self.row_limit = int(value)
-        return self
-
-    def insert(self, rows: dict[str, Any] | list[dict[str, Any]]):
-        self.insert_rows = rows if isinstance(rows, list) else [rows]
-        return self
-
-    def update(self, values: dict[str, Any]):
-        self.update_values = values or {}
-        return self
-
-    def upsert(self, rows: dict[str, Any] | list[dict[str, Any]], on_conflict: str | None = None):
-        self.upsert_rows = rows if isinstance(rows, list) else [rows]
-        self.upsert_conflict = on_conflict
-        return self
-
-    def execute(self):
-        with psycopg2.connect(self.database_url) as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                if self.insert_rows is not None:
-                    return self._execute_insert(cur)
-                if self.upsert_rows is not None:
-                    return self._execute_upsert(cur)
-                if self.update_values is not None:
-                    return self._execute_update(cur)
-                return self._execute_select(cur)
-
-    def _execute_select(self, cur):
-        params: list[Any] = []
-        where_sql = self._where_sql(params)
-        order_sql = ""
-        if self.orders:
-            order_sql = " ORDER BY " + ", ".join(
-                f"{self._ident(column)} {'DESC' if desc else 'ASC'}" for column, desc in self.orders
+def table_columns(table: str) -> set[str]:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table,),
             )
-        limit_sql = ""
-        if self.row_limit:
-            limit_sql = " LIMIT %s"
-            params.append(self.row_limit)
-        cur.execute(
-            f"SELECT {self._select_sql()} FROM {self._ident(self.table)}{where_sql}{order_sql}{limit_sql}",
-            params,
-        )
-        return QueryResult([self._normalize_row(dict(row)) for row in cur.fetchall()])
-
-    def _execute_insert(self, cur):
-        rows = [row for row in (self.insert_rows or []) if row]
-        if not rows:
-            return QueryResult([])
-        columns = list(rows[0].keys())
-        sql = (
-            f"INSERT INTO {self._ident(self.table)} ({', '.join(self._ident(column) for column in columns)}) "
-            f"VALUES ({', '.join(['%s'] * len(columns))}) RETURNING *"
-        )
-        data = []
-        for row in rows:
-            cur.execute(sql, [self._adapt_value(row.get(column)) for column in columns])
-            data.extend(self._normalize_row(dict(item)) for item in cur.fetchall())
-        return QueryResult(data)
-
-    def _execute_update(self, cur):
-        if not self.update_values:
-            return QueryResult([])
-        params = [self._adapt_value(value) for value in self.update_values.values()]
-        assignments = ", ".join(f"{self._ident(column)} = %s" for column in self.update_values)
-        where_sql = self._where_sql(params)
-        cur.execute(f"UPDATE {self._ident(self.table)} SET {assignments}{where_sql} RETURNING *", params)
-        return QueryResult([self._normalize_row(dict(row)) for row in cur.fetchall()])
-
-    def _execute_upsert(self, cur):
-        rows = [row for row in (self.upsert_rows or []) if row]
-        if not rows:
-            return QueryResult([])
-        columns = list(rows[0].keys())
-        conflict_columns = [column.strip() for column in (self.upsert_conflict or columns[0]).split(",") if column.strip()]
-        update_columns = [column for column in columns if column not in conflict_columns]
-        conflict_sql = "DO NOTHING"
-        if update_columns:
-            update_sql = ", ".join(f"{self._ident(column)} = EXCLUDED.{self._ident(column)}" for column in update_columns)
-            conflict_sql = f"DO UPDATE SET {update_sql}"
-        sql = (
-            f"INSERT INTO {self._ident(self.table)} ({', '.join(self._ident(column) for column in columns)}) "
-            f"VALUES ({', '.join(['%s'] * len(columns))}) "
-            f"ON CONFLICT ({', '.join(self._ident(column) for column in conflict_columns)}) {conflict_sql} RETURNING *"
-        )
-        data = []
-        for row in rows:
-            cur.execute(sql, [self._adapt_value(row.get(column)) for column in columns])
-            data.extend(self._normalize_row(dict(item)) for item in cur.fetchall())
-        return QueryResult(data)
-
-    def _where_sql(self, params: list[Any]) -> str:
-        if not self.filters:
-            return ""
-        clauses = []
-        for column, operator, value in self.filters:
-            if operator == "IN":
-                if not value:
-                    clauses.append("FALSE")
-                    continue
-                clauses.append(f"{self._ident(column)} = ANY(%s)")
-                params.append(list(value))
-                continue
-            clauses.append(f"{self._ident(column)} {operator} %s")
-            params.append(self._adapt_value(value))
-        return " WHERE " + " AND ".join(clauses)
-
-    def _select_sql(self) -> str:
-        if self.select_clause.strip() == "*":
-            return "*"
-        return ", ".join(self._ident(part.strip()) for part in self.select_clause.split(",") if part.strip())
-
-    @staticmethod
-    def _ident(value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value)):
-            raise ValueError(f"Unsafe SQL identifier: {value}")
-        return f'"{value}"'
-
-    @staticmethod
-    def _adapt_value(value: Any):
-        if isinstance(value, (dict, list)):
-            return Json(value, dumps=lambda obj: json.dumps(obj, default=str))
-        return value
-
-    @classmethod
-    def _normalize_row(cls, row: dict[str, Any]) -> dict[str, Any]:
-        return {key: cls._normalize_value(value) for key, value in row.items()}
-
-    @classmethod
-    def _normalize_value(cls, value: Any) -> Any:
-        if isinstance(value, Decimal):
-            return int(value) if value == value.to_integral_value() else float(value)
-        if isinstance(value, datetime):
-            return value.isoformat()
-        if isinstance(value, date):
-            return value.isoformat()
-        if isinstance(value, dict):
-            return {key: cls._normalize_value(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [cls._normalize_value(item) for item in value]
-        return value
+            return {row[0] for row in cur.fetchall()}
 
 
-class PostgresClient:
-    def __init__(self, database_url: str):
-        self.database_url = database_url
-
-    def table(self, table: str) -> PostgresQuery:
-        return PostgresQuery(self.database_url, table)
+def supports_column(table: str, column: str) -> bool:
+    return column in table_columns(table)
 
 
-def create_seodash_client():
-    database_url = os.getenv("SEODASH_DATABASE_URL", "").strip()
-    if database_url:
-        return PostgresClient(database_url)
+def filter_supported_columns(table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    columns = table_columns(table)
+    return [{key: value for key, value in row.items() if key in columns} for row in rows]
 
-    from supabase import create_client
 
-    supabase_url = os.getenv("SUPABASE_URL", "")
-    supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
-    if not supabase_url or not supabase_key:
-        raise RuntimeError("SEODASH_DATABASE_URL must be set, or legacy SUPABASE_URL/SUPABASE_SERVICE_KEY must be available")
-    return create_client(supabase_url, supabase_key)
+def upsert_rows(
+    table: str,
+    rows: list[dict[str, Any]],
+    conflict_cols: str | list[str],
+    chunk_size: int = 500,
+    filter_columns: bool = True,
+) -> int:
+    if not rows:
+        return 0
+    if isinstance(conflict_cols, str):
+        conflict = [col.strip() for col in conflict_cols.split(",") if col.strip()]
+    else:
+        conflict = list(conflict_cols)
+
+    clean_rows = [normalize_row(row) for row in rows]
+    if filter_columns:
+        clean_rows = filter_supported_columns(table, clean_rows)
+    clean_rows = [row for row in clean_rows if all(row.get(col) is not None for col in conflict)]
+    if not clean_rows:
+        return 0
+
+    all_keys = sorted({key for row in clean_rows for key in row.keys()})
+    update_keys = [key for key in all_keys if key not in set(conflict) and key != "id"]
+    columns_sql = ", ".join(f'"{key}"' for key in all_keys)
+    conflict_sql = ", ".join(f'"{key}"' for key in conflict)
+    if update_keys:
+        update_sql = ", ".join(f'"{key}" = EXCLUDED."{key}"' for key in update_keys)
+        on_conflict = f"DO UPDATE SET {update_sql}"
+    else:
+        on_conflict = "DO NOTHING"
+    sql = f'INSERT INTO "{table}" ({columns_sql}) VALUES %s ON CONFLICT ({conflict_sql}) {on_conflict}'
+    values = [tuple(adapt_value(row.get(key)) for key in all_keys) for row in clean_rows]
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for start in range(0, len(values), chunk_size):
+                execute_values(cur, sql, values[start:start + chunk_size], page_size=chunk_size)
+        conn.commit()
+    return len(clean_rows)
+
+
+def insert_rows(table: str, rows: list[dict[str, Any]], returning: str | None = None) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    clean_rows = filter_supported_columns(table, [normalize_row(row) for row in rows])
+    all_keys = sorted({key for row in clean_rows for key in row.keys()})
+    columns_sql = ", ".join(f'"{key}"' for key in all_keys)
+    returning_sql = f" RETURNING {returning}" if returning else ""
+    sql = f'INSERT INTO "{table}" ({columns_sql}) VALUES %s{returning_sql}'
+    values = [tuple(adapt_value(row.get(key)) for key in all_keys) for row in clean_rows]
+
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            execute_values(cur, sql, values, page_size=500)
+            result = [dict(row) for row in cur.fetchall()] if returning else []
+        conn.commit()
+    return [normalize_row(row) for row in result]
+
+
+def update_where(table: str, payload: dict[str, Any], filters: dict[str, Any]) -> int:
+    clean_payload = filter_supported_columns(table, [normalize_row(payload)])[0]
+    if not clean_payload or not filters:
+        return 0
+    set_sql = ", ".join(f'"{key}" = %s' for key in clean_payload)
+    where_sql = " AND ".join(f'"{key}" = %s' for key in filters)
+    values = [adapt_value(value) for value in clean_payload.values()] + [adapt_value(value) for value in filters.values()]
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f'UPDATE "{table}" SET {set_sql} WHERE {where_sql}', values)
+            count = cur.rowcount or 0
+        conn.commit()
+    return count
+
+
+def delete_where(table: str, filters: dict[str, Any]) -> int:
+    if not filters:
+        return 0
+    where_sql = " AND ".join(f'"{key}" = %s' for key in filters)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{table}" WHERE {where_sql}', list(filters.values()))
+            count = cur.rowcount or 0
+        conn.commit()
+    return count
+
+
+def select_rows(
+    table: str,
+    columns: str = "*",
+    filters: dict[str, Any] | None = None,
+    in_filters: dict[str, list[Any]] | None = None,
+    order_by: str | None = None,
+    desc: bool = False,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    where_parts = []
+    values: list[Any] = []
+    for key, value in (filters or {}).items():
+        where_parts.append(f'"{key}" = %s')
+        values.append(value)
+    for key, items in (in_filters or {}).items():
+        if not items:
+            return []
+        where_parts.append(f'"{key}" = ANY(%s)')
+        values.append(items)
+    sql = f'SELECT {columns} FROM "{table}"'
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+    if order_by:
+        sql += f' ORDER BY "{order_by}" {"DESC" if desc else "ASC"}'
+    if limit:
+        sql += " LIMIT %s"
+        values.append(limit)
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, values)
+            return [normalize_row(dict(row)) for row in cur.fetchall()]
+
+
+def start_ingestion_run(source: str, websites_attempted: list[str]) -> str:
+    run_id = str(uuid.uuid4())
+    insert_rows(
+        "ingestion_runs",
+        [{
+            "id": run_id,
+            "source": source,
+            "status": "running",
+            "websites_attempted": websites_attempted,
+        }],
+    )
+    return run_id
+
+
+def finish_ingestion_run(
+    run_id: str | None,
+    status: str,
+    websites_succeeded: list[str],
+    websites_failed: list[str],
+    error_details: dict[str, Any],
+    duration_seconds: int,
+) -> None:
+    if not run_id:
+        return
+    update_where(
+        "ingestion_runs",
+        {
+            "status": status,
+            "websites_succeeded": websites_succeeded,
+            "websites_failed": websites_failed,
+            "error_details": error_details,
+            "duration_seconds": duration_seconds,
+            "completed_at": datetime.utcnow().isoformat(),
+        },
+        {"id": run_id},
+    )
+
+
+def start_pipeline_run(pipeline: str) -> str:
+    run_id = str(uuid.uuid4())
+    insert_rows("pipeline_runs", [{"id": run_id, "pipeline": pipeline, "status": "running"}])
+    return run_id
+
+
+def finish_pipeline_run(run_id: str | None, status: str, duration_seconds: int, error_details: dict[str, Any] | None = None) -> None:
+    if not run_id:
+        return
+    update_where(
+        "pipeline_runs",
+        {
+            "status": "completed" if status in {"success", "partial"} else "failed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "error_message": None if status in {"success", "partial"} else json.dumps(error_details or {})[:1000],
+            "details": {"duration_seconds": duration_seconds},
+        },
+        {"id": run_id},
+    )

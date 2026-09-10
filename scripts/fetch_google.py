@@ -13,7 +13,7 @@ import time
 import uuid
 import re
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -582,14 +582,16 @@ def _pg_finish_pipeline_run(run_id: str | None, status: str, duration_seconds: i
         conn.close()
 
 
-def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = None):
+def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = None, site_report=None):
     conn = _pg_connection()
     if conn is None:
         return False
     today_str = date.today().isoformat()
+    fetched_at = datetime.now(tz=timezone.utc).isoformat()
     try:
         dm_rows = []
         for name, rows in all_data.items():
+            report = (site_report or {}).get(name, {})
             for row in rows:
                 db_row = {
                     "date": row.get("date"),
@@ -606,6 +608,11 @@ def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = 
                     "ga_bounce_rate": row.get("ga_bounce_rate"),
                     "data_source": "api",
                     "ingestion_run_id": run_id,
+                    "gsc_status": report.get("gsc_status"),
+                    "gsc_status_reason": report.get("gsc_reason"),
+                    "ga4_status": report.get("ga4_status"),
+                    "ga4_status_reason": report.get("ga4_reason"),
+                    "source_fetched_at": fetched_at,
                 }
                 dm_rows.append({k: v for k, v in db_row.items() if v is not None})
         c = _pg_batch_upsert(conn, "daily_metrics", dm_rows, ["date", "website"])
@@ -991,7 +998,7 @@ def main():
     upload_failed = False
     try:
         if use_postgres:
-            store_in_postgres(all_data, keywords_data, pages_data, run_id=run_id)
+            store_in_postgres(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
         else:
             store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id)
         if websites_failed and websites_succeeded:

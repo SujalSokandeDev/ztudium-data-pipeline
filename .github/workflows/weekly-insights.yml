@@ -1,11 +1,12 @@
-name: Weekly AI Insights
+name: SEODash Intelligence Reports
 
 on:
   schedule:
-    # Run weekly on Sunday at 23:00 UTC
-    - cron: '0 23 * * 0'
+    # Refresh deterministic intelligence daily after the Google fetch window.
+    - cron: '15 2 * * *'
   workflow_run:
     workflows:
+      - Daily Google Fetch (GSC + GA4)
       - Process Ahrefs CSVs
       - Process Keyword Gap CSVs
     types:
@@ -16,15 +17,13 @@ permissions:
   contents: read
 
 jobs:
-  weekly-insights:
+  seodash-intelligence:
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300
 
     env:
       SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
@@ -43,5 +42,5 @@ jobs:
       - name: Compute trend metrics
         run: python scripts/compute_trends.py
 
-      - name: Generate AI insights
+      - name: Generate SEODash intelligence reports
         run: python scripts/generate_insights.py

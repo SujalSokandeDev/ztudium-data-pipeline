@@ -41,11 +41,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Check Ahrefs traffic alerts
+      - name: Save Ahrefs traffic alerts
         run: |
-          ARGS="--send"
+          ARGS="--skip-email"
           if [ "$DRY_RUN_INPUT" = "true" ]; then
             ARGS="--dry-run"
+          fi
+          python scripts/check_ahrefs_traffic_alerts.py $ARGS
+
+      - name: Send Ahrefs traffic alert emails
+        continue-on-error: true
+        run: |
+          ARGS="--send --skip-dashboard"
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
+            ARGS="--dry-run --skip-dashboard"
           fi
           if [ "$TEST_RECIPIENT_INPUT" = "true" ]; then
             ARGS="$ARGS --test-recipient"

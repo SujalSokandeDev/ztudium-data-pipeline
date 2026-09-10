@@ -356,6 +356,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Evaluate alerts without sending emails or writing dashboard alerts")
     parser.add_argument("--test-recipient", action="store_true", help="Send to Sujal only for testing")
     parser.add_argument("--send", action="store_true", help="Actually send email alerts")
+    parser.add_argument("--skip-email", action="store_true", help="Only evaluate and write dashboard alerts; do not send emails")
     parser.add_argument("--skip-dashboard", action="store_true", help="Do not merge active alerts into daily_insights")
     args = parser.parse_args()
 
@@ -368,6 +369,10 @@ def main() -> None:
 
     if not args.skip_dashboard and not args.dry_run:
         upsert_dashboard_alerts(alerts)
+
+    if args.skip_email:
+        logger.info("Email send skipped. active=%d", len(alerts))
+        return
 
     recipients = TEST_RECIPIENTS if args.test_recipient else DEFAULT_RECIPIENTS
     run_date = _today_iso()

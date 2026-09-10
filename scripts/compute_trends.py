@@ -11,6 +11,7 @@ import json
 import logging
 from datetime import date, timedelta, datetime
 from collections import defaultdict
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,20 +24,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("supabase").setLevel(logging.WARNING)
 
 # ── Supabase setup ──────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from seodash_db import create_seodash_client  # noqa: E402
+
 try:
-    from supabase import create_client
-except ImportError:
-    logger.error("supabase package not installed. Run: pip install supabase")
+    supabase = create_seodash_client()
+except Exception as exc:
+    logger.error(str(exc))
     sys.exit(1)
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
-    sys.exit(1)
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Dynamic Anomaly Thresholds ──────────────────────────────
 # Each metric has its own rules: threshold %, minimum absolute change,

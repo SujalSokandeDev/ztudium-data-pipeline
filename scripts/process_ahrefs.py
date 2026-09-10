@@ -1,5 +1,5 @@
 """
-Process Ahrefs CSVs from Supabase Storage and upload parsed data to Supabase DB.
+Process Ahrefs CSVs from SEODash storage and upload parsed data to Supabase DB.
 
 This runs in GitHub Actions after CSVs are uploaded to storage.
 
@@ -7,7 +7,7 @@ Usage:
     python scripts/process_ahrefs.py --date-folder 2026-03-03
 
 What it does:
-  1. Downloads CSV/TXT files from Supabase Storage (ahrefs-exports bucket)
+  1. Downloads CSV/TXT files from SEODash storage (ahrefs-exports bucket)
   2. Parses overview .txt files (domain metrics, DR, backlinks, etc.)
   3. Parses 5 CSV types (organic keywords, referring domains, top pages,
      broken backlinks, organic competitors)
@@ -35,6 +35,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 sys.path.insert(0, os.path.dirname(__file__))
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, AHREFS_BUCKET, WEBSITES
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
+from seodash_storage import download_bucket_files
 
 try:
     from dotenv import load_dotenv
@@ -191,83 +192,24 @@ def _http_get(url: str, **kwargs):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Download from Supabase Storage
+#  Download from SEODash storage
 # ══════════════════════════════════════════════════════════════
 
 def download_from_storage(date_folder: str, temp_dir: str) -> list:
-    """Download all files from Supabase Storage bucket.
-    
-    Tries flat (root-level) files first (current upload format),
-    then falls back to date-prefixed folders (legacy format).
-    """
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-    }
-    list_url = f"{SUPABASE_URL}/storage/v1/object/list/{AHREFS_BUCKET}"
-
-    # Try root-level first (flat upload)
-    resp = _http_post(
-        list_url,
-        headers=headers,
-        json={"prefix": "", "limit": 200},
-        timeout=30,
-    )
-
-    if resp.status_code != 200:
-        logger.error("Failed to list files: HTTP %d — %s", resp.status_code, resp.text[:100])
+    """Download Ahrefs artifact files from DB-backed SEODash storage."""
+    try:
+        return download_bucket_files(
+            AHREFS_BUCKET,
+            date_folder,
+            temp_dir,
+            extensions=(".csv", ".txt"),
+            limit=200,
+        )
+    except Exception as e:
+        logger.error("Failed to download files from SEODash storage: %s", str(e)[:160], exc_info=True)
         return []
 
-    items = resp.json()
-    # Filter to actual files (have metadata/id, not just folder entries)
-    file_items = [f for f in items if f.get("name", "").endswith((".csv", ".txt"))]
 
-    # If no flat files, try date-prefixed folder
-    if not file_items:
-        logger.info("No root-level files, trying prefix: %s/", date_folder)
-        resp = _http_post(
-            list_url,
-            headers=headers,
-            json={"prefix": f"{date_folder}/", "limit": 200},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            file_items = resp.json()
-            prefix = f"{date_folder}/"
-        else:
-            return []
-    else:
-        prefix = ""
-
-    logger.info("Found %d files in storage bucket", len(file_items))
-
-    downloaded = []
-    for file_info in file_items:
-        name = file_info.get("name", "")
-        if not name:
-            continue
-
-        storage_path = f"{prefix}{name}" if prefix else name
-        download_url = f"{SUPABASE_URL}/storage/v1/object/{AHREFS_BUCKET}/{storage_path}"
-
-        try:
-            resp = _http_get(download_url, headers=headers, timeout=120)
-            if resp.status_code == 200:
-                local_path = os.path.join(temp_dir, name)
-                with open(local_path, "wb") as f:
-                    f.write(resp.content)
-                downloaded.append(local_path)
-                mb = len(resp.content) / 1024 / 1024
-                logger.info("  ✅ %s (%.2f MB)", name, mb)
-            else:
-                logger.error("  ❌ %s — HTTP %d", name, resp.status_code)
-        except Exception as e:
-            logger.error("  ❌ %s — %s", name, str(e)[:100], exc_info=True)
-
-    return downloaded
-
-
-# ══════════════════════════════════════════════════════════════
 #  Parsers (adapted from ahrefs_processor.py)
 # ══════════════════════════════════════════════════════════════
 
@@ -3193,7 +3135,7 @@ def upload_parsed_data(parsed_data, run_id: str | None = None, internal_linking_
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Process Ahrefs CSVs from Supabase Storage")
+    parser = argparse.ArgumentParser(description="Process Ahrefs CSVs from SEODash storage")
     parser.add_argument("--date-folder", default=date.today().isoformat(),
                         help="Date folder in storage (default: today)")
     parser.add_argument("--local-dir", default=None,

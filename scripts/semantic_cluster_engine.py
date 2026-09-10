@@ -26,16 +26,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-try:
-    from supabase import create_client
-except ImportError as exc:  # pragma: no cover
-    raise RuntimeError(f"Missing dependency: {exc}") from exc
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import SUPABASE_SERVICE_KEY, SUPABASE_URL, WEBSITES  # noqa: E402
+from config import WEBSITES  # noqa: E402
+from seodash_db import create_seodash_client  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -259,10 +255,7 @@ def upsert_many(client, table: str, rows: list[dict[str, Any]], on_conflict: str
 
 
 def materialize(trigger_source: str, requested_date: str | None = None, site_filter: str | None = None) -> dict[str, Any]:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
-
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    client = create_seodash_client()
     latest = fetch_latest_content_plan(client, requested_date)
     if not latest:
         raise RuntimeError("No daily_insights.content_plan found to materialize")

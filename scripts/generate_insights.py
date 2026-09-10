@@ -38,14 +38,24 @@ logging.getLogger("supabase").setLevel(logging.WARNING)
 
 # ── Dependencies ────────────────────────────────────────────
 try:
-    from supabase import create_client
     from openai import OpenAI
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, Json
 except ImportError as e:
-    logger.error(f"Missing package: {e}. Run: pip install supabase openai")
+    logger.error(f"Missing package: {e}. Run: pip install openai psycopg2-binary")
     sys.exit(1)
+
+create_client = None
+if not os.getenv("SEODASH_DATABASE_URL", "").strip():
+    try:
+        from supabase import create_client
+    except ImportError as e:
+        logger.error(f"Missing package for legacy Supabase fallback: {e}. Run: pip install supabase")
+        sys.exit(1)
 
 from ai_client import get_ai_client, ai_chat_completion_reliable, response_model_used, response_provider_used
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
+from seodash_storage import upload_object
 try:
     from ai_client import _switch_to_gemini
 except ImportError:
@@ -53,18 +63,184 @@ except ImportError:
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SEODASH_DATABASE_URL = os.getenv("SEODASH_DATABASE_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
+if not SEODASH_DATABASE_URL and (not SUPABASE_URL or not SUPABASE_KEY):
+    logger.error("SEODASH_DATABASE_URL must be set, or legacy SUPABASE_URL/SUPABASE_SERVICE_KEY must be available")
     sys.exit(1)
 
-if not OPENAI_API_KEY and not GEMINI_API_KEY:
-    logger.error("At least one of OPENAI_API_KEY or GEMINI_API_KEY must be set")
-    sys.exit(1)
+AI_AVAILABLE = bool(OPENAI_API_KEY or GEMINI_API_KEY)
+ENABLE_AI_INSIGHTS_NARRATIVE = os.getenv("ENABLE_AI_INSIGHTS_NARRATIVE", "false").lower() in {"1", "true", "yes"}
+AI_INSIGHTS_NARRATIVE_AVAILABLE = AI_AVAILABLE and ENABLE_AI_INSIGHTS_NARRATIVE
+if not AI_AVAILABLE:
+    logger.warning("No AI provider configured; deterministic intelligence reports will still be generated")
+elif not ENABLE_AI_INSIGHTS_NARRATIVE:
+    logger.info("AI keys are configured, but AI insights narrative enrichment is disabled; using deterministic reports")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+class _QueryResult:
+    def __init__(self, data=None):
+        self.data = data or []
+
+
+class _PostgresQuery:
+    def __init__(self, database_url, table):
+        self.database_url = database_url
+        self.table = table
+        self.select_clause = "*"
+        self.filters = []
+        self.orders = []
+        self.row_limit = None
+        self.update_values = None
+        self.upsert_row = None
+        self.upsert_conflict = None
+
+    def select(self, select_clause):
+        self.select_clause = select_clause or "*"
+        return self
+
+    def eq(self, column, value):
+        self.filters.append((column, "=", value))
+        return self
+
+    def neq(self, column, value):
+        self.filters.append((column, "<>", value))
+        return self
+
+    def gte(self, column, value):
+        self.filters.append((column, ">=", value))
+        return self
+
+    def gt(self, column, value):
+        self.filters.append((column, ">", value))
+        return self
+
+    def lte(self, column, value):
+        self.filters.append((column, "<=", value))
+        return self
+
+    def lt(self, column, value):
+        self.filters.append((column, "<", value))
+        return self
+
+    def order(self, column, desc=False):
+        self.orders.append((column, bool(desc)))
+        return self
+
+    def limit(self, value):
+        self.row_limit = int(value)
+        return self
+
+    def update(self, values):
+        self.update_values = values or {}
+        return self
+
+    def upsert(self, row, on_conflict=None):
+        self.upsert_row = row or {}
+        self.upsert_conflict = on_conflict
+        return self
+
+    def execute(self):
+        with psycopg2.connect(self.database_url) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if self.upsert_row is not None:
+                    return self._execute_upsert(cur)
+                if self.update_values is not None:
+                    return self._execute_update(cur)
+                return self._execute_select(cur)
+
+    def _execute_select(self, cur):
+        params = []
+        where_sql = self._where_sql(params)
+        order_sql = ""
+        if self.orders:
+            order_sql = " ORDER BY " + ", ".join(
+                f"{self._ident(column)} {'DESC' if desc else 'ASC'}" for column, desc in self.orders
+            )
+        limit_sql = " LIMIT %s" if self.row_limit else ""
+        if self.row_limit:
+            params.append(self.row_limit)
+        cur.execute(
+            f"SELECT {self._select_sql()} FROM {self._ident(self.table)}{where_sql}{order_sql}{limit_sql}",
+            params,
+        )
+        return _QueryResult([dict(row) for row in cur.fetchall()])
+
+    def _execute_update(self, cur):
+        if not self.update_values:
+            return _QueryResult([])
+        params = [self._adapt_value(value) for value in self.update_values.values()]
+        assignments = ", ".join(f"{self._ident(column)} = %s" for column in self.update_values)
+        where_sql = self._where_sql(params)
+        cur.execute(
+            f"UPDATE {self._ident(self.table)} SET {assignments}{where_sql}",
+            params,
+        )
+        return _QueryResult([])
+
+    def _execute_upsert(self, cur):
+        rows = self.upsert_row if isinstance(self.upsert_row, list) else [self.upsert_row]
+        rows = [row for row in rows if row]
+        if not rows:
+            return _QueryResult([])
+        columns = list(rows[0].keys())
+        placeholders = ", ".join(["%s"] * len(columns))
+        conflict = self._ident(self.upsert_conflict or columns[0])
+        update_columns = [column for column in columns if column != (self.upsert_conflict or columns[0])]
+        conflict_sql = "DO NOTHING"
+        if update_columns:
+            update_sql = ", ".join(f"{self._ident(column)} = EXCLUDED.{self._ident(column)}" for column in update_columns)
+            conflict_sql = f"DO UPDATE SET {update_sql}"
+        sql = (
+            f"""
+            INSERT INTO {self._ident(self.table)} ({", ".join(self._ident(column) for column in columns)})
+            VALUES ({placeholders})
+            ON CONFLICT ({conflict}) {conflict_sql}
+            """
+        )
+        cur.executemany(
+            sql,
+            [[self._adapt_value(row.get(column)) for column in columns] for row in rows],
+        )
+        return _QueryResult([])
+
+    def _where_sql(self, params):
+        if not self.filters:
+            return ""
+        clauses = []
+        for column, operator, value in self.filters:
+            clauses.append(f"{self._ident(column)} {operator} %s")
+            params.append(self._adapt_value(value))
+        return " WHERE " + " AND ".join(clauses)
+
+    def _select_sql(self):
+        if self.select_clause.strip() == "*":
+            return "*"
+        return ", ".join(self._ident(part.strip()) for part in self.select_clause.split(",") if part.strip())
+
+    @staticmethod
+    def _ident(value):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value)):
+            raise ValueError(f"Unsafe SQL identifier: {value}")
+        return f'"{value}"'
+
+    @staticmethod
+    def _adapt_value(value):
+        if isinstance(value, (dict, list)):
+            return Json(value, dumps=lambda obj: json.dumps(obj, default=str))
+        return value
+
+
+class _PostgresClient:
+    def __init__(self, database_url):
+        self.database_url = database_url
+
+    def table(self, table):
+        return _PostgresQuery(self.database_url, table)
+
+
+supabase = _PostgresClient(SEODASH_DATABASE_URL) if SEODASH_DATABASE_URL else create_client(SUPABASE_URL, SUPABASE_KEY)
 # AI client with automatic Gemini fallback (managed by ai_client module)
 openai_client = get_ai_client()
 
@@ -1380,6 +1556,10 @@ RULES:
 
 def generate_insights(context):
     """Send prioritized context to GPT-4o-mini and get structured insights."""
+    if not AI_INSIGHTS_NARRATIVE_AVAILABLE:
+        logger.info("  Building deterministic legacy insights because AI narrative enrichment is disabled or unavailable")
+        return _build_deterministic_legacy_insights(context)
+
     context_str = summarize_context(context)
     _ensure_gemini_priority("Legacy strategic insights should run on Gemini 3.1 Pro Preview")
 
@@ -1699,6 +1879,376 @@ def _fallback_network_report(site_reports):
     }
 
 
+def _score_pct_delta(delta, good_when_up=True, scale=1.0):
+    """Normalize a percent delta to a conservative score contribution."""
+    value = _num(delta)
+    if not good_when_up:
+        value = -value
+    return max(-20, min(20, value * scale))
+
+
+def _latest_site_ahrefs(context, website):
+    rows = _site_rows(context.get("ahrefs_overview"), website)
+    if not rows:
+        return None
+    return sorted(rows, key=lambda row: str(row.get("date", "")), reverse=True)[0]
+
+
+def _data_confidence(context, website):
+    recent_rows = _site_rows(context.get("daily_metrics_7d"), website)
+    ahrefs = _latest_site_ahrefs(context, website)
+    has_gsc = any(_num(row.get("gsc_clicks")) > 0 or _num(row.get("gsc_impressions")) > 0 for row in recent_rows)
+    has_ga = any(row.get("ga_sessions") is not None for row in recent_rows)
+    has_ahrefs = bool(ahrefs)
+    score = (45 if has_gsc else 0) + (25 if has_ga else 0) + (20 if has_ahrefs else 0) + (10 if len(recent_rows) >= 3 else 0)
+    if score >= 75:
+        level = "high"
+    elif score >= 45:
+        level = "medium"
+    else:
+        level = "low"
+    return {
+        "level": level,
+        "score": score,
+        "has_gsc": has_gsc,
+        "has_ga": has_ga,
+        "has_ahrefs": has_ahrefs,
+        "recent_metric_days": len({str(row.get("date", ""))[:10] for row in recent_rows if row.get("date")}),
+        "ahrefs_date": ahrefs.get("date") if ahrefs else None,
+    }
+
+
+def _deterministic_health_score(now, prev, ahrefs, alerts, opportunities, confidence):
+    click_delta = _pct_change(now["gsc_clicks"], prev["gsc_clicks"])
+    impression_delta = _pct_change(now["gsc_impressions"], prev["gsc_impressions"])
+    session_delta = _pct_change(now["ga_sessions"], prev["ga_sessions"])
+    position_delta = now["gsc_position"] - prev["gsc_position"] if now["gsc_position"] and prev["gsc_position"] else 0
+    score = 68
+    score += _score_pct_delta(click_delta, True, 0.30)
+    score += _score_pct_delta(impression_delta, True, 0.12)
+    if confidence["has_ga"]:
+        score += _score_pct_delta(session_delta, True, 0.18)
+    score += _score_pct_delta(position_delta, False, 1.8)
+    if ahrefs:
+        dr = _num(ahrefs.get("dr"))
+        score += max(-8, min(8, (dr - 50) * 0.12))
+    score -= min(18, len(alerts) * 6)
+    score += min(8, len(opportunities) * 2)
+    if confidence["level"] == "low":
+        score -= 8
+    elif confidence["level"] == "medium":
+        score -= 3
+    return int(max(0, min(100, round(score))))
+
+
+def _dashboard_link(path, website):
+    return f"{path}?website={website.replace(' ', '%20')}"
+
+
+def _build_deterministic_alerts(website, context, now, prev, confidence):
+    alerts = []
+    click_delta = _pct_change(now["gsc_clicks"], prev["gsc_clicks"])
+    impression_delta = _pct_change(now["gsc_impressions"], prev["gsc_impressions"])
+    session_delta = _pct_change(now["ga_sessions"], prev["ga_sessions"])
+    position_delta = now["gsc_position"] - prev["gsc_position"] if now["gsc_position"] and prev["gsc_position"] else 0
+
+    if click_delta <= -15 and now["gsc_clicks"] < prev["gsc_clicks"]:
+        diagnosis = "CTR Issue" if impression_delta > -5 else "Ranking Loss"
+        alerts.append({
+            "type": "traffic_drop",
+            "diagnosis_type": diagnosis,
+            "title": "Search clicks declined",
+            "what_happened": f"GSC clicks changed {click_delta}% week over week ({int(now['gsc_clicks'])} vs {int(prev['gsc_clicks'])}).",
+            "why_it_matters": "Search demand is the strongest reliable signal in the current data set.",
+            "root_cause_hypothesis": "Click decline is likely tied to ranking, CTR, or SERP movement based on GSC deltas.",
+            "action": "Review the affected keywords and pages in Performance before making content changes.",
+            "estimated_traffic_impact": int(max(0, prev["gsc_clicks"] - now["gsc_clicks"])),
+            "dashboard_link": _dashboard_link("/performance", website),
+        })
+
+    if confidence["has_ga"] and session_delta <= -20 and abs(click_delta) <= 10:
+        alerts.append({
+            "type": "tracking_or_engagement_drop",
+            "diagnosis_type": "Tracking / Engagement Issue",
+            "title": "GA sessions diverged from GSC",
+            "what_happened": f"GA sessions changed {session_delta}% while GSC clicks changed {click_delta}%.",
+            "why_it_matters": "A GA-only drop can point to tracking, consent, landing-page, or engagement issues.",
+            "root_cause_hypothesis": "GSC demand did not move enough to explain the GA session change.",
+            "action": "Validate GA tags and landing-page tracking for this site.",
+            "estimated_traffic_impact": int(max(0, prev["ga_sessions"] - now["ga_sessions"])),
+            "dashboard_link": _dashboard_link("/performance", website),
+        })
+
+    if position_delta >= 2:
+        alerts.append({
+            "type": "rank_loss",
+            "diagnosis_type": "Ranking Loss",
+            "title": "Average position worsened",
+            "what_happened": f"Average position moved from {round(prev['gsc_position'], 1)} to {round(now['gsc_position'], 1)}.",
+            "why_it_matters": "Lower rankings reduce future click capture even if impressions remain available.",
+            "root_cause_hypothesis": "Ranking pressure is visible in the weighted average position trend.",
+            "action": "Check top losing keywords and add supporting internal links.",
+            "estimated_traffic_impact": int(max(0, prev["gsc_clicks"] - now["gsc_clicks"])),
+            "dashboard_link": _dashboard_link("/performance", website),
+        })
+
+    broken = _site_rows(context.get("broken_backlinks"), website)
+    high_dr_broken = [row for row in broken if _num(row.get("ref_domain_dr")) >= 40]
+    if high_dr_broken:
+        top = sorted(high_dr_broken, key=lambda row: _num(row.get("ref_domain_dr")), reverse=True)[0]
+        alerts.append({
+            "type": "broken_backlinks",
+            "diagnosis_type": "Site-Specific Issue",
+            "title": "High-DR backlink needs recovery",
+            "what_happened": f"{len(high_dr_broken)} high-DR broken backlink target(s) are visible for {website}.",
+            "why_it_matters": "Broken authority paths can waste link equity and referral opportunity.",
+            "root_cause_hypothesis": "At least one high-authority referring page points to a broken or unresolved target.",
+            "action": f"Recover or redirect {top.get('target_url') or 'the top broken backlink target'}.",
+            "estimated_traffic_impact": int(min(250, max(25, _num(top.get("ref_domain_dr")) * 3))),
+            "dashboard_link": "/internal-linking",
+        })
+
+    anomalies = _site_rows(context.get("anomalies_7d"), website)
+    for anomaly in anomalies[:2]:
+        alerts.append({
+            "type": "metric_anomaly",
+            "diagnosis_type": "Site-Specific Issue",
+            "title": clean_text(anomaly.get("metric_name") or "Metric anomaly")[:60],
+            "what_happened": clean_text(anomaly.get("anomaly_description")) or "A calculated metric anomaly was detected.",
+            "why_it_matters": "Anomaly rows are generated from recent metric behavior and should be reviewed quickly.",
+            "root_cause_hypothesis": "The metric moved outside its recent baseline.",
+            "action": "Open the relevant dashboard section and compare the latest day against the prior week.",
+            "estimated_traffic_impact": int(abs(_num(anomaly.get("week_over_week_pct"))) * 2),
+            "dashboard_link": "/ai-insights",
+        })
+
+    return sorted(alerts, key=lambda item: _num(item.get("estimated_traffic_impact")), reverse=True)[:3]
+
+
+def _build_deterministic_opportunities(website, context):
+    opportunities = []
+    easy_wins = sorted(
+        _site_rows(context.get("easy_wins"), website),
+        key=lambda row: (_num(row.get("opportunity_score")), _num(row.get("volume"))),
+        reverse=True,
+    )
+    for row in easy_wins[:2]:
+        opportunities.append({
+            "type": "keyword_gap",
+            "title": f"Create content for {clean_text(row.get('keyword'))[:54]}",
+            "insight": f"Keyword gap opportunity: volume {int(_num(row.get('volume')))}, KD {int(_num(row.get('kd')))}, score {round(_num(row.get('opportunity_score')), 1)}.",
+            "action": "Review the keyword gap and prepare a content brief.",
+            "estimated_traffic_gain": int(max(10, _num(row.get("volume")) * 0.08)),
+            "dashboard_link": "/content-gap",
+        })
+
+    internal = detect_internal_link_gaps(website)
+    for row in internal.get("top_suggestions", [])[:1]:
+        opportunities.append({
+            "type": "internal_link",
+            "title": f"Add internal link to {clean_text(row.get('target_page_keyword') or row.get('target_page'))[:50]}",
+            "insight": f"Pending internal-link suggestion with score {round(_num(row.get('score')), 1)}.",
+            "action": "Review anchor placement and approve the link suggestion.",
+            "estimated_traffic_gain": int(max(5, _num(row.get("score")) * 1.5)),
+            "dashboard_link": "/internal-linking",
+        })
+
+    return sorted(opportunities, key=lambda item: _num(item.get("estimated_traffic_gain")), reverse=True)[:3]
+
+
+def _build_deterministic_momentum(website, context, now, prev):
+    signals = []
+    click_delta = _pct_change(now["gsc_clicks"], prev["gsc_clicks"])
+    impression_delta = _pct_change(now["gsc_impressions"], prev["gsc_impressions"])
+    session_delta = _pct_change(now["ga_sessions"], prev["ga_sessions"])
+    if click_delta >= 10 and now["gsc_clicks"] > 0:
+        signals.append({
+            "title": "Search clicks improved",
+            "detail": f"GSC clicks increased {click_delta}% week over week ({int(now['gsc_clicks'])} vs {int(prev['gsc_clicks'])}).",
+        })
+    if impression_delta >= 15 and now["gsc_impressions"] > 0:
+        signals.append({
+            "title": "Search visibility expanded",
+            "detail": f"GSC impressions increased {impression_delta}% week over week.",
+        })
+    if session_delta >= 10 and now["ga_sessions"] > 0:
+        signals.append({
+            "title": "GA sessions improved",
+            "detail": f"GA sessions increased {session_delta}% week over week.",
+        })
+    new_backlinks = sorted(
+        _site_rows(context.get("new_backlinks"), website),
+        key=lambda row: _num(row.get("dr")),
+        reverse=True,
+    )
+    if new_backlinks:
+        signals.append({
+            "title": "Authority signal available",
+            "detail": f"High-DR referring domain signal found from {new_backlinks[0].get('domain')} (DR {int(_num(new_backlinks[0].get('dr')))}).",
+        })
+    return signals[:2]
+
+
+def _build_deterministic_site_report(website, context):
+    now = _metric_totals(context.get("daily_metrics_7d"), website)
+    prev = _metric_totals(context.get("daily_metrics_prev_week"), website)
+    ahrefs = _latest_site_ahrefs(context, website)
+    confidence = _data_confidence(context, website)
+    alerts = _build_deterministic_alerts(website, context, now, prev, confidence)
+    opportunities = _build_deterministic_opportunities(website, context)
+    momentum = _build_deterministic_momentum(website, context, now, prev)
+    score = _deterministic_health_score(now, prev, ahrefs, alerts, opportunities, confidence)
+    if score >= 70:
+        direction = "improving" if momentum and not alerts else "stable"
+    elif score < 50:
+        direction = "declining"
+    else:
+        direction = "declining" if alerts else "stable"
+
+    if confidence["level"] == "low":
+        headline = f"{website} has limited fresh measurement coverage"
+        summary = f"{website} has limited recent measurement coverage, so the score is based on available GSC, GA, Ahrefs, alert, and opportunity signals rather than AI narrative analysis."
+    elif alerts:
+        headline = f"{website} needs attention on {alerts[0]['title'].lower()}"
+        summary = f"{website} scores {score}/100 from deterministic SEO signals. The main pressure is {alerts[0]['what_happened']} Top next step: {alerts[0]['action']}"
+    elif momentum:
+        headline = f"{website} is showing positive search momentum"
+        summary = f"{website} scores {score}/100 from deterministic SEO signals. {momentum[0]['detail']} Keep monitoring opportunities and preserve the current growth pattern."
+    else:
+        headline = f"{website} is stable on current SEO signals"
+        summary = f"{website} scores {score}/100 from deterministic SEO signals with no high-priority alert detected in the latest window."
+
+    report = {
+        "site": website,
+        "health_score": score,
+        "health_direction": direction,
+        "headline": headline,
+        "critical_alerts": alerts,
+        "opportunities": opportunities,
+        "momentum_signals": momentum,
+        "silent_decay_alerts": [],
+        "dead_pages_summary": {
+            "visible_unclicked_count": 0,
+            "invisible_count": 0,
+            "total_dead_pages": 0,
+            "visible_unclicked": [],
+            "invisible": [],
+        },
+        "limited_ai_insight": False,
+        "ai_retry_pending": bool(AI_INSIGHTS_NARRATIVE_AVAILABLE),
+        "ai_model_used": "deterministic-v1",
+        "ai_provider_used": "deterministic",
+        "data_confidence": confidence,
+        "week_summary": summary,
+    }
+    return _normalize_site_report(website, report)
+
+
+def _build_deterministic_site_reports(context):
+    return {site: _build_deterministic_site_report(site, context) for site in SITES}
+
+
+def _data_freshness(context):
+    dates = []
+    for row in context.get("daily_metrics_7d", []) or []:
+        raw_date = str(row.get("date") or "")[:10]
+        if raw_date:
+            dates.append(raw_date)
+    latest_date = max(dates) if dates else None
+    age_days = None
+    is_stale = True
+    if latest_date:
+        try:
+            age_days = (date.today() - date.fromisoformat(latest_date)).days
+            is_stale = age_days > 3
+        except ValueError:
+            age_days = None
+            is_stale = True
+    return {
+        "latestDailyMetricsDate": latest_date,
+        "dailyMetricsAgeDays": age_days,
+        "isStale": is_stale,
+        "checkedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_deterministic_network_report(site_reports, context=None):
+    if not site_reports:
+        return _fallback_network_report(site_reports)
+    freshness = _data_freshness(context or {})
+    scores = [int(_num(report.get("health_score"), 0)) for report in site_reports.values()]
+    mean_score = round(sum(scores) / len(scores)) if scores else 0
+    sorted_reports = sorted(site_reports.items(), key=lambda item: int(_num(item[1].get("health_score"), 0)))
+    priority, priority_report = sorted_reports[0]
+    winner, winner_report = sorted_reports[-1]
+    declining = [site for site, report in site_reports.items() if report.get("health_direction") == "declining"]
+    improving = [site for site, report in site_reports.items() if report.get("health_direction") == "improving"]
+    event = classify_network_event(site_reports)
+    if len(declining) >= 3:
+        trend = "declining"
+    elif len(improving) > len(declining):
+        trend = "improving"
+    else:
+        trend = "stable"
+    patterns = []
+    if len(declining) >= 3:
+        patterns.append({
+            "pattern": "Multiple sites show declining deterministic health signals",
+            "sites_affected": declining,
+            "interpretation": "This can indicate portfolio-wide search pressure or a shared measurement issue.",
+            "recommended_response": "Validate data freshness first, then compare ranking and CTR changes before broad content edits.",
+        })
+    return {
+        "network_health_score": mean_score,
+        "network_trend": trend,
+        "algorithm_update_detected": len(declining) >= 3,
+        "algorithm_update_confidence": "medium" if len(declining) >= 3 else "none",
+        "algorithm_update_explanation": "Three or more sites declined at the same time." if len(declining) >= 3 else "",
+        "top_priority_site": priority,
+        "top_priority_reason": priority_report.get("headline") or f"{priority} has the lowest deterministic health score.",
+        "network_winner": winner,
+        "network_winner_reason": winner_report.get("headline") or f"{winner} has the strongest deterministic health score.",
+        "cross_site_patterns": patterns,
+        "network_event_type": event.get("network_event_type"),
+        "network_event_label": event.get("network_event_label"),
+        "network_event_summary": event.get("network_event_summary"),
+        "affected_sites": event.get("affected_sites", []),
+        "network_event_action": event.get("network_event_action"),
+        "resource_allocation_recommendation": f"Prioritize {priority} first, then work through the highest-impact alerts and opportunities.",
+        "limited_ai_insight": False,
+        "ai_retry_pending": bool(AI_INSIGHTS_NARRATIVE_AVAILABLE),
+        "ai_model_used": "deterministic-v1",
+        "ai_provider_used": "deterministic",
+        "data_freshness": freshness,
+        "network_summary": f"Network health is {mean_score}/100 from deterministic SEO signals across {len(site_reports)} sites. {priority} is the top priority and {winner} is currently the strongest performer. Gemini narrative enrichment is optional and does not affect the score.",
+    }
+
+
+def _build_deterministic_legacy_insights(context):
+    site_reports = _build_deterministic_site_reports(context)
+    network_report = _build_deterministic_network_report(site_reports, context)
+    insights = [{
+        "category": "momentum" if network_report["network_trend"] == "improving" else "urgent" if network_report["network_trend"] == "declining" else "content_gap",
+        "severity": "high" if network_report["network_health_score"] < 50 else "medium",
+        "title": f"Network health {network_report['network_health_score']}/100 from deterministic signals",
+        "analysis": network_report["network_summary"],
+        "action": network_report["resource_allocation_recommendation"],
+        "impact": "This insight is generated from database metrics and does not require Gemini.",
+        "related_website": "all",
+    }]
+    for site, report in sorted(site_reports.items(), key=lambda item: _num(item[1].get("health_score")))[:3]:
+        insights.append({
+            "category": "urgent" if report.get("critical_alerts") else "momentum",
+            "severity": "high" if _num(report.get("health_score")) < 50 else "medium",
+            "title": report.get("headline"),
+            "analysis": report.get("week_summary"),
+            "action": (report.get("critical_alerts") or report.get("opportunities") or [{"action": "Continue monitoring this site."}])[0].get("action"),
+            "impact": f"{site} deterministic health score is {report.get('health_score')}/100.",
+            "related_website": site,
+        })
+    return insights[:6]
+
+
 def _analyze_network(site_reports):
     def build_site_summaries(compact=False):
         lines = []
@@ -1957,12 +2507,22 @@ def _track_alert_history(site_reports):
 
 
 def generate_v2_insights(context):
-    """Run 9 site-level Gemini analyses plus one network meta-analysis."""
-    _ensure_gemini_priority("AI Insights v2 requires Gemini")
+    """Build deterministic v2 reports, with optional Gemini narrative enrichment."""
+    logger.info("  Building deterministic v2 site intelligence reports")
+    deterministic_reports = _build_deterministic_site_reports(context)
+
+    if not AI_INSIGHTS_NARRATIVE_AVAILABLE:
+        site_reports = _enrich_site_reports(deterministic_reports, context)
+        site_reports = _track_alert_history(site_reports)
+        network_report = _build_deterministic_network_report(site_reports, context)
+        network_report = {**network_report, **classify_network_event(site_reports)}
+        return site_reports, network_report
+
+    _ensure_gemini_priority("AI Insights v2 narrative enrichment should run on Gemini")
 
     logger.info("  Building v2 site contexts")
     site_contexts = {site: build_site_context(site, context) for site in SITES}
-    site_reports = {}
+    site_reports = dict(deterministic_reports)
 
     with Spinner("Analyzing 9 site intelligence reports"):
         with ThreadPoolExecutor(max_workers=9) as executor:
@@ -1973,20 +2533,25 @@ def generate_v2_insights(context):
             for future in as_completed(futures):
                 site = futures[future]
                 try:
-                    site_reports[site] = future.result()
+                    ai_report = future.result()
+                    if ai_report and not ai_report.get("limited_ai_insight"):
+                        site_reports[site] = ai_report
                 except Exception as e:
                     logger.error(f"  V2 site worker failed for {site}: {e}")
-                    site_reports[site] = _fallback_site_report(site)
+                    site_reports[site] = deterministic_reports.get(site) or _fallback_site_report(site)
 
     for site in SITES:
         if site not in site_reports:
-            site_reports[site] = _fallback_site_report(site)
+            site_reports[site] = deterministic_reports.get(site) or _fallback_site_report(site)
 
     site_reports = _enrich_site_reports(site_reports, context)
     site_reports = _track_alert_history(site_reports)
 
     with Spinner("Analyzing network intelligence report"):
-        network_report = _analyze_network(site_reports)
+        network_report = _analyze_network(site_reports) if AI_INSIGHTS_NARRATIVE_AVAILABLE else _build_deterministic_network_report(site_reports, context)
+    if network_report.get("limited_ai_insight"):
+        network_report = _build_deterministic_network_report(site_reports, context)
+    network_report.setdefault("data_freshness", _data_freshness(context))
     network_report = {**network_report, **classify_network_event(site_reports)}
 
     return site_reports, network_report
@@ -2008,6 +2573,7 @@ HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
 ALLOWED_KEYWORD_RE = re.compile(r"^[A-Za-z0-9\s&'\".,:;!?()/+\-_%#@$\[\]]+$")
 ALLOWED_LABEL_RE = re.compile(r"^[A-Za-z0-9\s&'\".,:;!?()/+\-_%#@$\[\]]+$")
 CONTROL_CHAR_RE = re.compile(r"[\u0000-\u001F\u007F-\u009F\uFFFD]")
+GENERIC_CLUSTER_LABELS = {"other", "general", "uncategorized", "unknown", "misc", "miscellaneous", "n/a", "none"}
 
 
 def clean_text(value: str | None) -> str:
@@ -2117,6 +2683,26 @@ def find_question_keyword(keywords: list) -> str | None:
     return None
 
 
+def _topic_tokens(value: str | None) -> set[str]:
+    cleaned = clean_text(value).lower()
+    return {
+        word
+        for word in re.split(r"\s+", cleaned)
+        if len(word) > 2 and word not in CORE_TOPIC_STRIP
+    }
+
+
+def _same_topic(left: str | None, right: str | None) -> bool:
+    left_tokens = _topic_tokens(extract_core_topic(left or ""))
+    right_tokens = _topic_tokens(extract_core_topic(right or ""))
+    overlap = left_tokens.intersection(right_tokens)
+    if not overlap:
+        return False
+    if min(len(left_tokens), len(right_tokens)) >= 2:
+        return len(overlap) >= 2
+    return True
+
+
 def compute_opportunity_score(volume: int, kd: int) -> float:
     """Compute opportunity score: high volume + low difficulty = high score."""
     return min(9999.99, round(volume * (1 / (kd + 1)), 1))
@@ -2124,13 +2710,13 @@ def compute_opportunity_score(volume: int, kd: int) -> float:
 
 CLUSTER_MIN_PER_SITE = int(os.getenv("CLUSTER_MIN_PER_SITE", "5"))
 CLUSTER_MAX_PER_SITE = int(os.getenv("CLUSTER_MAX_PER_SITE", "10"))
-ENABLE_AI_CLUSTERING = os.getenv("ENABLE_AI_CLUSTERING", "true").lower() in {"1", "true", "yes"}
+ENABLE_AI_CLUSTERING = os.getenv("ENABLE_AI_CLUSTERING", "false").lower() in {"1", "true", "yes"}
 
 
 def keyword_cluster_key(keyword: str, cluster_label: str | None = None) -> str:
     """Create a stable semantic bucket label for deterministic cluster fill-in."""
     label = clean_text(cluster_label)
-    if label:
+    if label and label.lower() not in GENERIC_CLUSTER_LABELS:
         return sanitize_cluster_label(label, keyword, extract_core_topic(keyword))
 
     core = extract_core_topic(keyword)
@@ -2199,7 +2785,9 @@ def build_validated_cluster(site: str, topic: str, keywords: list[dict], relaxed
             f"Build a focused {site} content cluster around {topic}, using the pillar keyword and supporting spokes to capture validated search demand.",
         ),
     }
-    question_keyword = find_question_keyword(all_keywords)
+    question_keyword = find_question_keyword(
+        [kw for kw in all_keywords if _same_topic(kw.get("keyword"), primary_keyword["keyword"])]
+    )
     if question_keyword:
         cluster["question_keyword"] = question_keyword
     relaxed_count = sum(1 for kw in all_keywords if kw.get("relaxed"))
@@ -2479,8 +3067,8 @@ def generate_content_plan(context):
     if len(content_context) > 22000:
         content_context = content_context[:22000] + "\n[...truncated]"
 
-    if not ENABLE_AI_CLUSTERING:
-        logger.info("  AI clustering disabled; building validated deterministic clusters from keyword gap data")
+    if not ENABLE_AI_CLUSTERING or not AI_AVAILABLE:
+        logger.info("  AI clustering unavailable/disabled; building validated deterministic clusters from keyword gap data")
         plan = {"week_of": date.today().isoformat(), "sites": []}
         validated_sites = []
         site_map = {}
@@ -2757,23 +3345,27 @@ def generate_content_plan(context):
 #  STORAGE
 # ══════════════════════════════════════════════════════════════
 
+def _json_ready(value):
+    return json.loads(json.dumps(value, default=str))
+
+
 def store_insights(insights, content_plan=None, site_reports=None, network_report=None):
     """Store legacy insights, content plan, and v2 intelligence reports."""
     today_str = date.today().isoformat()
 
     row = {
         "date": today_str,
-        "insights": json.dumps(insights),
+        "insights": _json_ready(insights),
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "dismissed_by_user": False,
     }
 
     if content_plan is not None:
-        row["content_plan"] = json.dumps(content_plan)
+        row["content_plan"] = _json_ready(content_plan)
     if site_reports is not None:
-        row["v2_site_reports"] = json.dumps(site_reports)
+        row["v2_site_reports"] = _json_ready(site_reports)
     if network_report is not None:
-        row["v2_network_report"] = json.dumps(network_report)
+        row["v2_network_report"] = _json_ready(network_report)
 
     try:
         supabase.table("daily_insights").upsert(
@@ -3146,30 +3738,17 @@ def _build_weekly_pdf(site_reports, network_report):
 def generate_weekly_pdf_report(site_reports, network_report):
     """Generate and upload the branded weekly SEO intelligence PDF."""
     try:
-        import requests
-
         pdf_bytes = _build_weekly_pdf(site_reports, network_report)
         bucket = os.getenv("WEEKLY_REPORTS_BUCKET", "weekly-reports")
         path = f"{date.today().isoformat()}.pdf"
-        auth_headers = {"Authorization": f"Bearer {SUPABASE_KEY}", "apikey": SUPABASE_KEY}
-        bucket_resp = requests.post(
-            f"{SUPABASE_URL}/storage/v1/bucket",
-            headers=auth_headers,
-            json={"id": bucket, "name": bucket, "public": False},
-            timeout=30,
+        upload_object(
+            bucket,
+            path,
+            pdf_bytes,
+            "application/pdf",
+            metadata={"source": "generate_insights", "report_date": date.today().isoformat()},
         )
-        if bucket_resp.status_code not in (200, 201, 409) and "Duplicate" not in bucket_resp.text:
-            logger.warning("  Weekly PDF bucket check failed: %s %s", bucket_resp.status_code, bucket_resp.text[:160])
-        upload_resp = requests.post(
-            f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}",
-            headers={**auth_headers, "Content-Type": "application/pdf", "x-upsert": "true"},
-            data=pdf_bytes,
-            timeout=60,
-        )
-        if not upload_resp.ok:
-            logger.error("  Weekly PDF upload failed: %s %s", upload_resp.status_code, upload_resp.text[:200])
-            return None
-        logger.info("  Weekly PDF report uploaded to Supabase Storage: %s/%s", bucket, path)
+        logger.info("  Weekly PDF report uploaded to SEODash storage: %s/%s", bucket, path)
         return {"bucket": bucket, "path": path, "bytes": len(pdf_bytes)}
     except Exception as e:
         logger.error("  Weekly PDF generation failed: %s", e)

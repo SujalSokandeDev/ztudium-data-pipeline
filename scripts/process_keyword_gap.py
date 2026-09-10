@@ -1,5 +1,5 @@
 """
-Process keyword gap CSVs from Supabase Storage and upsert to content_gap_keywords.
+Process keyword gap CSVs from SEODash storage and upsert to content_gap_keywords.
 
 Usage:
     python scripts/process_keyword_gap.py --date-folder 2026-03-03
@@ -29,6 +29,7 @@ import sys
 sys.path.insert(0, sys_path)
 from config import KEYWORD_GAP_BUCKET, SUPABASE_SERVICE_KEY, SUPABASE_URL
 from semantic_cluster_engine import materialize as materialize_semantic_clusters
+from seodash_storage import download_bucket_files
 
 logging.basicConfig(
     level=logging.INFO,
@@ -455,51 +456,17 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
 
 
 def download_from_storage(date_folder: str, temp_dir: str) -> list[str]:
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-    }
-    list_url = f"{SUPABASE_URL}/storage/v1/object/list/{KEYWORD_GAP_BUCKET}"
-
-    resp = _http_post(
-        list_url,
-        headers=headers,
-        json={"prefix": "", "limit": 500},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        logger.error("Failed to list bucket files (HTTP %d)", resp.status_code)
-        return []
-
-    items = [item for item in resp.json() if item.get("name", "").lower().endswith(".csv")]
-    prefix = ""
-    if not items:
-        resp = _http_post(
-            list_url,
-            headers=headers,
-            json={"prefix": f"{date_folder}/", "limit": 500},
-            timeout=30,
+    try:
+        return download_bucket_files(
+            KEYWORD_GAP_BUCKET,
+            date_folder,
+            temp_dir,
+            extensions=(".csv",),
+            limit=500,
         )
-        if resp.status_code == 200:
-            items = [item for item in resp.json() if item.get("name", "").lower().endswith(".csv")]
-            prefix = f"{date_folder}/"
-
-    downloaded = []
-    for item in items:
-        name = item.get("name", "")
-        if not name:
-            continue
-        storage_path = f"{prefix}{name}" if prefix else name
-        url = f"{SUPABASE_URL}/storage/v1/object/{KEYWORD_GAP_BUCKET}/{storage_path}"
-        r = _http_get(url, headers=headers, timeout=120)
-        if r.status_code != 200:
-            logger.warning("Failed to download %s (HTTP %d)", storage_path, r.status_code)
-            continue
-        local_path = os.path.join(temp_dir, name)
-        with open(local_path, "wb") as f:
-            f.write(r.content)
-        downloaded.append(local_path)
-    return downloaded
+    except Exception as exc:
+        logger.error("Failed to download files from SEODash storage: %s", str(exc)[:160])
+        return []
 
 
 def _is_retryable_upsert_error(exc: Exception) -> bool:

@@ -12,7 +12,7 @@ import logging
 import time
 import uuid
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -549,7 +549,7 @@ def _supports_column(client, table: str, column: str) -> bool:
     return _COLUMN_SUPPORT_CACHE[key]
 
 
-def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None):
+def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None, site_report=None):
     """Upload all fetched data to Supabase."""
     from supabase import create_client
 
@@ -558,11 +558,20 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
         return
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     daily_metrics_has_ingestion_run_id = _supports_column(client, "daily_metrics", "ingestion_run_id")
+    daily_metrics_source_status_columns = {
+        "gsc_status": _supports_column(client, "daily_metrics", "gsc_status"),
+        "gsc_status_reason": _supports_column(client, "daily_metrics", "gsc_status_reason"),
+        "ga4_status": _supports_column(client, "daily_metrics", "ga4_status"),
+        "ga4_status_reason": _supports_column(client, "daily_metrics", "ga4_status_reason"),
+        "source_fetched_at": _supports_column(client, "daily_metrics", "source_fetched_at"),
+    }
     today_str = date.today().isoformat()
+    fetched_at = datetime.now(timezone.utc).isoformat()
 
     # Daily metrics
     dm_rows = []
     for name, rows in all_data.items():
+        source_status = (site_report or {}).get(name, {})
         for row in rows:
             db_row = {
                 "date": row.get("date"),
@@ -581,6 +590,16 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
             }
             if run_id and daily_metrics_has_ingestion_run_id:
                 db_row["ingestion_run_id"] = run_id
+            if daily_metrics_source_status_columns["gsc_status"]:
+                db_row["gsc_status"] = source_status.get("gsc_status")
+            if daily_metrics_source_status_columns["gsc_status_reason"]:
+                db_row["gsc_status_reason"] = source_status.get("gsc_reason")
+            if daily_metrics_source_status_columns["ga4_status"]:
+                db_row["ga4_status"] = source_status.get("ga4_status")
+            if daily_metrics_source_status_columns["ga4_status_reason"]:
+                db_row["ga4_status_reason"] = source_status.get("ga4_reason")
+            if daily_metrics_source_status_columns["source_fetched_at"]:
+                db_row["source_fetched_at"] = fetched_at
             dm_rows.append({k: v for k, v in db_row.items() if v is not None})
     c = batch_upsert(client, "daily_metrics", dm_rows, "date,website")
     logger.info("  daily_metrics: %d/%d upserted", c, len(dm_rows))
@@ -762,7 +781,7 @@ def main():
     status = "success"
     upload_failed = False
     try:
-        store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id)
+        store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
         if websites_failed and websites_succeeded:
             status = "partial"
         elif websites_failed and not websites_succeeded:

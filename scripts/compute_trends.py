@@ -126,6 +126,9 @@ DAILY_METRICS = [
     "domain_rating", "ahrefs_keywords", "ahrefs_top3",
     "backlinks_total", "ref_domains_total",
 ]
+GSC_METRICS = {"gsc_clicks", "gsc_impressions", "gsc_ctr", "gsc_position"}
+GA4_METRICS = {"ga_sessions", "ga_organic_sessions", "ga_bounce_rate"}
+SOURCE_STATUS_COLUMNS = ["gsc_status", "ga4_status"]
 
 LOOKBACK_DAYS = 95  # enough for 90-day percentile calculation
 
@@ -188,7 +191,7 @@ def fetch_daily_data(website, days=LOOKBACK_DAYS):
     """Fetch daily_metrics for a website, ordered by date ascending."""
     since = (date.today() - timedelta(days=days)).isoformat()
     if SEODASH_DATABASE_URL:
-        columns = ["date", "website", *DAILY_METRICS]
+        columns = ["date", "website", *DAILY_METRICS, *SOURCE_STATUS_COLUMNS]
         with psycopg2.connect(SEODASH_DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -208,13 +211,26 @@ def fetch_daily_data(website, days=LOOKBACK_DAYS):
                 ]
 
     result = supabase.table("daily_metrics") \
-        .select("date, website, " + ", ".join(DAILY_METRICS)) \
+        .select("date, website, " + ", ".join([*DAILY_METRICS, *SOURCE_STATUS_COLUMNS])) \
         .eq("website", website) \
         .gte("date", since) \
         .order("date", desc=False) \
         .limit(1000) \
         .execute()
     return result.data or []
+
+
+def source_complete_for_metric(row, metric):
+    """Return false when a source-specific metric is present only as a missing-source row."""
+    if metric in GSC_METRICS:
+        status = row.get("gsc_status")
+        if status is not None:
+            return status in {"ok", "partial"}
+    if metric in GA4_METRICS:
+        status = row.get("ga4_status")
+        if status is not None:
+            return status == "ok"
+    return True
 
 
 def get_all_websites():
@@ -296,7 +312,10 @@ def compute_trends_for_website(website, rows):
     anomaly_directions = {}  # metric -> "drop"/"spike" for site-wide detection
 
     for metric in DAILY_METRICS:
-        values = [row.get(metric) for row in rows]
+        values = [
+            row.get(metric) if source_complete_for_metric(row, metric) else None
+            for row in rows
+        ]
 
         # Find latest non-None value
         latest_val = None

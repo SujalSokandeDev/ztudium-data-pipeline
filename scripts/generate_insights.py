@@ -363,7 +363,8 @@ def gather_context():
         "daily_metrics",
         "date, website, gsc_clicks, gsc_impressions, gsc_ctr, gsc_position, "
         "ga_sessions, ga_organic_sessions, ga_bounce_rate, domain_rating, "
-        "ahrefs_keywords, ahrefs_top3, backlinks_total, ref_domains_total",
+        "ahrefs_keywords, ahrefs_top3, backlinks_total, ref_domains_total, "
+        "gsc_status, ga4_status",
         filters=[("gte", ("date", week_ago))],
         order=("date", True),
         limit=500,
@@ -373,7 +374,8 @@ def gather_context():
     # ── 2. Daily metrics: previous week (for WoW comparison) ─
     context["daily_metrics_prev_week"] = safe_query(
         "daily_metrics",
-        "date, website, gsc_clicks, gsc_impressions, ga_sessions, ga_organic_sessions",
+        "date, website, gsc_clicks, gsc_impressions, ga_sessions, ga_organic_sessions, "
+        "gsc_status, ga4_status",
         filters=[("gte", ("date", two_weeks_ago)), ("lt", ("date", week_ago))],
         order=("date", True),
         limit=500,
@@ -969,6 +971,26 @@ def _site_rows(rows, website):
     return [r for r in rows or [] if r.get("website") == website]
 
 
+GSC_METRIC_FIELDS = {"gsc_clicks", "gsc_impressions", "gsc_ctr", "gsc_position"}
+GA4_METRIC_FIELDS = {"ga_sessions", "ga_organic_sessions", "ga_bounce_rate"}
+
+
+def _source_complete_for_metric(row, metric):
+    if metric in GSC_METRIC_FIELDS:
+        status = row.get("gsc_status")
+        if status is not None:
+            return status in {"ok", "partial"}
+    if metric in GA4_METRIC_FIELDS:
+        status = row.get("ga4_status")
+        if status is not None:
+            return status == "ok"
+    return True
+
+
+def _metric_value(row, metric):
+    return _num(row.get(metric)) if _source_complete_for_metric(row, metric) else 0
+
+
 def _latest_by_key(rows, key_field):
     latest = {}
     for row in sorted(rows or [], key=lambda r: str(r.get("date", ""))):
@@ -1171,12 +1193,12 @@ def detect_internal_link_gaps(website):
 def _metric_totals(rows, website):
     site_rows = _site_rows(rows, website)
     return {
-        "gsc_clicks": sum(_num(r.get("gsc_clicks")) for r in site_rows),
-        "gsc_impressions": sum(_num(r.get("gsc_impressions")) for r in site_rows),
-        "ga_sessions": sum(_num(r.get("ga_sessions")) for r in site_rows),
+        "gsc_clicks": sum(_metric_value(r, "gsc_clicks") for r in site_rows),
+        "gsc_impressions": sum(_metric_value(r, "gsc_impressions") for r in site_rows),
+        "ga_sessions": sum(_metric_value(r, "ga_sessions") for r in site_rows),
         "gsc_position": (
-            sum(_num(r.get("gsc_position")) for r in site_rows if r.get("gsc_position") is not None)
-            / max(1, len([r for r in site_rows if r.get("gsc_position") is not None]))
+            sum(_num(r.get("gsc_position")) for r in site_rows if r.get("gsc_position") is not None and _source_complete_for_metric(r, "gsc_position"))
+            / max(1, len([r for r in site_rows if r.get("gsc_position") is not None and _source_complete_for_metric(r, "gsc_position")]))
         ),
     }
 
@@ -1897,8 +1919,8 @@ def _latest_site_ahrefs(context, website):
 def _data_confidence(context, website):
     recent_rows = _site_rows(context.get("daily_metrics_7d"), website)
     ahrefs = _latest_site_ahrefs(context, website)
-    has_gsc = any(_num(row.get("gsc_clicks")) > 0 or _num(row.get("gsc_impressions")) > 0 for row in recent_rows)
-    has_ga = any(row.get("ga_sessions") is not None for row in recent_rows)
+    has_gsc = any(_source_complete_for_metric(row, "gsc_clicks") and (_num(row.get("gsc_clicks")) > 0 or _num(row.get("gsc_impressions")) > 0) for row in recent_rows)
+    has_ga = any(_source_complete_for_metric(row, "ga_sessions") and row.get("ga_sessions") is not None for row in recent_rows)
     has_ahrefs = bool(ahrefs)
     score = (45 if has_gsc else 0) + (25 if has_ga else 0) + (20 if has_ahrefs else 0) + (10 if len(recent_rows) >= 3 else 0)
     if score >= 75:
@@ -3562,7 +3584,7 @@ def _fetch_pdf_click_trends(days=90):
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     rows = safe_query(
         "daily_metrics",
-        "date, website, gsc_clicks",
+        "date, website, gsc_clicks, gsc_status",
         filters=[("gte", ("date", cutoff))],
         order=("date", True),
         limit=5000,
@@ -3572,7 +3594,7 @@ def _fetch_pdf_click_trends(days=90):
     for row in rows:
         site = row.get("website")
         row_date = str(row.get("date", ""))
-        if site and row_date:
+        if site and row_date and _source_complete_for_metric(row, "gsc_clicks"):
             by_site_date[site][row_date] += _num(row.get("gsc_clicks"))
     trends = {}
     for site in SITES:

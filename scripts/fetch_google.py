@@ -593,6 +593,12 @@ def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = 
         for name, rows in all_data.items():
             report = (site_report or {}).get(name, {})
             for row in rows:
+                has_gsc_row = any(row.get(key) is not None for key in ("gsc_clicks", "gsc_impressions", "gsc_ctr", "gsc_position"))
+                has_ga4_row = any(row.get(key) is not None for key in ("ga_sessions", "ga_users", "ga_organic_sessions", "ga_organic_users", "ga_engagement_time", "ga_bounce_rate"))
+                gsc_status = report.get("gsc_status") if has_gsc_row else "skip"
+                gsc_reason = report.get("gsc_reason") if has_gsc_row else "No GSC row returned for this date"
+                ga4_status = report.get("ga4_status") if has_ga4_row else "skip"
+                ga4_reason = report.get("ga4_reason") if has_ga4_row else "No GA4 row returned for this date"
                 db_row = {
                     "date": row.get("date"),
                     "website": name,
@@ -608,10 +614,10 @@ def store_in_postgres(all_data, keywords_data, pages_data, run_id: str | None = 
                     "ga_bounce_rate": row.get("ga_bounce_rate"),
                     "data_source": "api",
                     "ingestion_run_id": run_id,
-                    "gsc_status": report.get("gsc_status"),
-                    "gsc_status_reason": report.get("gsc_reason"),
-                    "ga4_status": report.get("ga4_status"),
-                    "ga4_status_reason": report.get("ga4_reason"),
+                    "gsc_status": gsc_status,
+                    "gsc_status_reason": gsc_reason,
+                    "ga4_status": ga4_status,
+                    "ga4_status_reason": ga4_reason,
                     "source_fetched_at": fetched_at,
                 }
                 dm_rows.append({k: v for k, v in db_row.items() if v is not None})
@@ -783,7 +789,7 @@ def _supports_column(client, table: str, column: str) -> bool:
     return _COLUMN_SUPPORT_CACHE[key]
 
 
-def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None):
+def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = None, site_report=None):
     """Upload all fetched data to Supabase."""
     from supabase import create_client
 
@@ -792,12 +798,23 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
         return
     client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     daily_metrics_has_ingestion_run_id = _supports_column(client, "daily_metrics", "ingestion_run_id")
+    daily_metrics_status_columns = {
+        "gsc_status": _supports_column(client, "daily_metrics", "gsc_status"),
+        "gsc_status_reason": _supports_column(client, "daily_metrics", "gsc_status_reason"),
+        "ga4_status": _supports_column(client, "daily_metrics", "ga4_status"),
+        "ga4_status_reason": _supports_column(client, "daily_metrics", "ga4_status_reason"),
+        "source_fetched_at": _supports_column(client, "daily_metrics", "source_fetched_at"),
+    }
     today_str = date.today().isoformat()
+    fetched_at = datetime.now(tz=timezone.utc).isoformat()
 
     # Daily metrics
     dm_rows = []
     for name, rows in all_data.items():
+        report = (site_report or {}).get(name, {})
         for row in rows:
+            has_gsc_row = any(row.get(key) is not None for key in ("gsc_clicks", "gsc_impressions", "gsc_ctr", "gsc_position"))
+            has_ga4_row = any(row.get(key) is not None for key in ("ga_sessions", "ga_users", "ga_organic_sessions", "ga_organic_users", "ga_engagement_time", "ga_bounce_rate"))
             db_row = {
                 "date": row.get("date"),
                 "website": name,
@@ -815,6 +832,16 @@ def store_in_supabase(all_data, keywords_data, pages_data, run_id: str | None = 
             }
             if run_id and daily_metrics_has_ingestion_run_id:
                 db_row["ingestion_run_id"] = run_id
+            status_values = {
+                "gsc_status": report.get("gsc_status") if has_gsc_row else "skip",
+                "gsc_status_reason": report.get("gsc_reason") if has_gsc_row else "No GSC row returned for this date",
+                "ga4_status": report.get("ga4_status") if has_ga4_row else "skip",
+                "ga4_status_reason": report.get("ga4_reason") if has_ga4_row else "No GA4 row returned for this date",
+                "source_fetched_at": fetched_at,
+            }
+            for key, value in status_values.items():
+                if daily_metrics_status_columns.get(key):
+                    db_row[key] = value
             dm_rows.append({k: v for k, v in db_row.items() if v is not None})
     c = batch_upsert(client, "daily_metrics", dm_rows, "date,website")
     logger.info("  daily_metrics: %d/%d upserted", c, len(dm_rows))
@@ -1000,7 +1027,7 @@ def main():
         if use_postgres:
             store_in_postgres(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
         else:
-            store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id)
+            store_in_supabase(all_data, keywords_data, pages_data, run_id=run_id, site_report=site_report)
         if websites_failed and websites_succeeded:
             status = "partial"
         elif websites_failed and not websites_succeeded:

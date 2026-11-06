@@ -190,3 +190,33 @@ Workflows are defined in `.github/workflows/` and operate under specific constra
 - **Google API Authentication Failures (403):** Verify that the service account email is explicitly added as a delegated owner in the Google Search Console property and Google Analytics 4 property settings.
 - **Database Statement Timeouts:** Ensure PostgreSQL indexes defined in `004_indexes_and_constraints.sql` are active. Extremely large CSV files may require adjustments to the chunk size in the processing scripts.
 - **AI Payload Generation Failures:** Inspect the `ingestion_runs` table logs. If both OpenAI and Gemini providers exhaust their quotas simultaneously, the execution will abort safely without corrupting database state.
+
+## Ahrefs Traffic Alerts
+
+`scripts/check_ahrefs_traffic_alerts.py` checks the latest imported Ahrefs
+organic traffic per website. Warning is below 2,500; critical is below 2,000.
+Missing/invalid values are skipped, not treated as zero. Snapshot dates are
+included, with an import-refresh reminder when the data is over seven days old.
+
+The daily workflow runs at 06:30 UTC (12:00 noon IST), subject to GitHub scheduling
+delays. It emails only affected websites, once per site/severity/UTC day, until
+recovery. A same-day escalation may produce one additional critical email.
+
+Final recipients are Sujal (`sujal.sokande@ztudium.com`), Neeraj
+(`neeraj.rajpal@ztudium.com`) and Jon (`jonathan.vdb@ztudium.com`).
+Explicit test mode sends only to Sujal; labelled test messages cannot go to the
+team. No CC/BCC or other recipient groups are allowed.
+
+Configure `SEODASH_DATABASE_URL` and `RESEND_API_KEY` in Actions secrets. The
+sender defaults to `AI.DNA Platform Intelligence <noreply@citiesabc.com>` and can
+be overridden with repository variable `AHREFS_ALERT_FROM_EMAIL`. It must be
+verified in that Resend account. The old placeholder `RESEND_FROM_EMAIL` secret
+is no longer used by the workflow. Local runs can use `RESEND_FROM_EMAIL`.
+
+Database history plus Resend idempotency keys prevent duplicate delivery;
+bounded retries cover timeouts, rate limits and server errors. Persistent
+delivery/history failures fail the workflow rather than being hidden.
+
+Run unit tests with `python -m unittest discover -s tests -p 'test_ahrefs_traffic_alerts*.py'`.
+For real-schema tests, set `RUN_AHREFS_DB_TESTS=1`; session-local temporary tables
+and mocked delivery prevent changes to production data or live email sends.

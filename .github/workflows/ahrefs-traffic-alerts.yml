@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ahrefs-traffic-alerts
+  cancel-in-progress: false
+
 jobs:
   ahrefs-traffic-alerts:
     runs-on: ubuntu-latest
@@ -25,7 +29,8 @@ jobs:
     env:
       SEODASH_DATABASE_URL: ${{ secrets.SEODASH_DATABASE_URL }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-      RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+      # Sender is public configuration. Do not reuse the old unverified placeholder secret.
+      RESEND_FROM_EMAIL: ${{ vars.AHREFS_ALERT_FROM_EMAIL || 'AI.DNA Platform Intelligence <noreply@citiesabc.com>' }}
       DRY_RUN_INPUT: ${{ github.event.inputs.dry_run || 'false' }}
       TEST_RECIPIENT_INPUT: ${{ github.event.inputs.test_recipient || 'false' }}
 
@@ -50,7 +55,6 @@ jobs:
           python scripts/check_ahrefs_traffic_alerts.py $ARGS
 
       - name: Send Ahrefs traffic alert emails
-        continue-on-error: true
         run: |
           ARGS="--send --skip-dashboard"
           if [ "$DRY_RUN_INPUT" = "true" ]; then
